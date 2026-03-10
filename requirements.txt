@@ -1,0 +1,5 @@
+PyQt5>=5.15
+opencv-python>=4.5.0
+pandas>=1.0.0
+numpy>=1.18.0
+openpyxl>=3.0.0
