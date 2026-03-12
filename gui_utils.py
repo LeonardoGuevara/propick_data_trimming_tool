@@ -22,6 +22,18 @@ def format_time_extended(total_seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
+def format_fps(fps: float, decimals: int = 9) -> str:
+    """Format FPS with high precision while trimming insignificant trailing zeros."""
+    try:
+        val = float(fps)
+    except Exception:
+        return "0"
+    if abs(val) < 1e-12:
+        return "0"
+    text = f"{val:.{max(0, int(decimals))}f}".rstrip('0').rstrip('.')
+    return text if text else "0"
+
+
 def seconds_to_frames(seconds: float, fps: float) -> int:
     """Convert seconds to frame count."""
     return int(seconds * fps)

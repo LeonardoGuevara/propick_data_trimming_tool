@@ -6,7 +6,62 @@ from typing import Optional, Tuple, List
 import cv2
 import numpy as np
 import pandas as pd
+import subprocess
 from models import SensorData, VideoData
+
+
+def _parse_fps_fraction(raw_value: str) -> Optional[float]:
+    """Parse ffprobe FPS values like '30000/1001' with full precision."""
+    try:
+        value = (raw_value or '').strip()
+        if not value or value in {'0/0', 'N/A'}:
+            return None
+        if '/' in value:
+            num_str, den_str = value.split('/', 1)
+            num = float(num_str)
+            den = float(den_str)
+            if den == 0:
+                return None
+            out = num / den
+            return out if out > 0 else None
+        out = float(value)
+        return out if out > 0 else None
+    except Exception:
+        return None
+
+
+def _probe_precise_fps(video_path: Path, fallback_fps: float) -> float:
+    """Probe a stable precise FPS from ffprobe.
+
+    When avg_frame_rate and r_frame_rate differ notably, prefer r_frame_rate (nominal
+    stream rate) because it is usually more stable for frame-index based tools.
+    """
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=avg_frame_rate,r_frame_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            str(video_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return fallback_fps
+
+        lines = [line.strip() for line in (result.stdout or '').splitlines() if line.strip()]
+        avg = _parse_fps_fraction(lines[0]) if len(lines) >= 1 else None
+        rfr = _parse_fps_fraction(lines[1]) if len(lines) >= 2 else None
+
+        if avg and rfr:
+            if abs(avg - rfr) <= 0.01:
+                return avg
+            return rfr
+        if avg:
+            return avg
+        if rfr:
+            return rfr
+    except Exception:
+        pass
+    return fallback_fps
 
 
 def read_data_file(file_path: Path) -> Tuple[pd.DataFrame, str]:
@@ -48,7 +103,8 @@ def load_video(video_path: Path, is_primary: bool = False) -> VideoData:
     if not cap.isOpened():
         raise IOError(f"Could not open video: {video_path}")
     
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps_cv = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    fps = _probe_precise_fps(video_path, fps_cv)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

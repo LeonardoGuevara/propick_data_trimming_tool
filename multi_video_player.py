@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from typing import Optional, Dict, List
 from models import VideoData, SensorData
-from gui_utils import format_time, get_gaze_columns, find_closest_timestamp_index
+from gui_utils import format_time, format_fps, get_gaze_columns, find_closest_timestamp_index
 
 
 class SingleVideoDisplay(QtWidgets.QWidget):
@@ -14,6 +14,7 @@ class SingleVideoDisplay(QtWidgets.QWidget):
     
     frame_changed = QtCore.pyqtSignal(int)  # Emits current frame number
     move_to_beginning_clicked = QtCore.pyqtSignal()
+    move_to_end_clicked = QtCore.pyqtSignal()
     
     def __init__(self, video: VideoData, video_name: str, is_primary: bool = False,
                  gaze_data: Optional[SensorData] = None, parent=None):
@@ -95,6 +96,10 @@ class SingleVideoDisplay(QtWidgets.QWidget):
         self.move_to_beginning_button = QtWidgets.QPushButton("Move to Beginning")
         self.move_to_beginning_button.clicked.connect(self._on_move_to_beginning)
         button_layout.addWidget(self.move_to_beginning_button)
+
+        self.move_to_end_button = QtWidgets.QPushButton("Move to End")
+        self.move_to_end_button.clicked.connect(self._on_move_to_end)
+        button_layout.addWidget(self.move_to_end_button)
         
         button_layout.addStretch()
         layout.addLayout(button_layout)
@@ -108,7 +113,9 @@ class SingleVideoDisplay(QtWidgets.QWidget):
         layout.addWidget(self.slider)
         
         # Frame info
-        self.frame_info = QtWidgets.QLabel(f"Frame: 0 / {self.video.frame_count} | FPS: {self.video.fps:.1f}")
+        self.frame_info = QtWidgets.QLabel(
+            f"Frame: 0 / {self.video.frame_count} | FPS: {format_fps(self.video.fps)}"
+        )
         layout.addWidget(self.frame_info)
         
         self.setLayout(layout)
@@ -146,8 +153,28 @@ class SingleVideoDisplay(QtWidgets.QWidget):
             self._restart_timer()
     
     def _on_timer(self) -> None:
-        """Handle timer tick for playback - always advance by 1 for smooth playback."""
-        self.current_frame += 1
+        """Handle playback tick.
+
+        Advance based on real elapsed time so decode-heavy videos do not appear slower
+        than other videos when playback falls behind.
+        """
+        import time
+
+        now = time.perf_counter()
+        if self._last_frame_time <= 0:
+            self._last_frame_time = now
+
+        if self._target_frame_time > 0:
+            elapsed = max(0.0, now - self._last_frame_time)
+            frames_to_advance = max(1, int(elapsed / self._target_frame_time))
+            frames_to_advance = min(frames_to_advance, 8)
+            self._last_frame_time += frames_to_advance * self._target_frame_time
+            if now - self._last_frame_time > (self._target_frame_time * 8):
+                self._last_frame_time = now
+        else:
+            frames_to_advance = 1
+
+        self.current_frame += frames_to_advance
         
         if self.current_frame >= self.video.frame_count:
             self.current_frame = self.video.frame_count - 1
@@ -192,6 +219,17 @@ class SingleVideoDisplay(QtWidgets.QWidget):
             start_frame = getattr(self.video, 'start_frame', 0)
             start_frame = max(0, min(start_frame, self.video.frame_count - 1))
             self.set_frame(start_frame)
+
+    def _on_move_to_end(self) -> None:
+        """Request that the display jumps to the trim end frame for this video."""
+        try:
+            self.move_to_end_clicked.emit()
+        except Exception:
+            # Fallback to previous behaviour: use stored end_frame
+            end_frame = getattr(self.video, 'end_frame', self.video.frame_count - 1)
+            end_frame = self.video.frame_count - 1 if end_frame is None else end_frame
+            end_frame = max(0, min(end_frame, self.video.frame_count - 1))
+            self.set_frame(end_frame)
     
     def synchronize_to_frame(self, primary_frame: int, primary_video: VideoData) -> None:
         """Synchronize this video to a frame in the primary video."""
@@ -283,7 +321,9 @@ class SingleVideoDisplay(QtWidgets.QWidget):
             current_time = self.current_frame / self.video.fps
             total_time = self.video.duration
             self.time_label.setText(f"{format_time(current_time)} / {format_time(total_time)}")
-            self.frame_info.setText(f"Frame: {self.current_frame} / {self.video.frame_count} | FPS: {self.video.fps:.1f}")
+            self.frame_info.setText(
+                f"Frame: {self.current_frame} / {self.video.frame_count} | FPS: {format_fps(self.video.fps)}"
+            )
         
         self.frame_changed.emit(self.current_frame)
     
@@ -316,6 +356,7 @@ class MultiVideoPlayerWidget(QtWidgets.QWidget):
     
     frame_changed = QtCore.pyqtSignal(int)  # Emits current frame of primary video
     move_to_beginning_requested = QtCore.pyqtSignal(str)
+    move_to_end_requested = QtCore.pyqtSignal(str)
     
     def __init__(self, primary_video: VideoData, parent=None):
         super().__init__(parent)
@@ -370,9 +411,11 @@ class MultiVideoPlayerWidget(QtWidgets.QWidget):
             display.frame_changed.connect(self._on_primary_frame_changed)
             # connect display's move-to-beginning to be relayed with id
             display.move_to_beginning_clicked.connect(lambda vid=video_id: self.move_to_beginning_requested.emit(vid))
+            display.move_to_end_clicked.connect(lambda vid=video_id: self.move_to_end_requested.emit(vid))
         else:
             # connect non-primary displays as well
             display.move_to_beginning_clicked.connect(lambda vid=video_id: self.move_to_beginning_requested.emit(vid))
+            display.move_to_end_clicked.connect(lambda vid=video_id: self.move_to_end_requested.emit(vid))
         
         # Place display into a responsive 2xN grid (primary at index 0)
         # Use a deferred relayout to avoid heavy immediate layout work
@@ -486,6 +529,19 @@ class MultiVideoPlayerWidget(QtWidgets.QWidget):
         for display in self.video_displays.values():
             if display.playing:
                 display.toggle_play()
+
+    def step_all_frames(self, delta: int) -> None:
+        """Move all videos by one or more frames in lockstep."""
+        if delta == 0:
+            return
+
+        # Pause first so the step lands on a stable frame across all displays.
+        for display in self.video_displays.values():
+            if display.playing:
+                display.toggle_play()
+
+        for display in self.video_displays.values():
+            display.set_frame(display.current_frame + int(delta))
     
     def is_any_playing(self) -> bool:
         """Check if any video is currently playing."""

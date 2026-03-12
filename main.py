@@ -10,7 +10,7 @@ from data_loader import find_eye_tracking_files, load_video, load_sensor_data
 from multi_video_player import MultiVideoPlayerWidget
 from sync_trim_panel import SyncTrimPanel
 from data_exporter import export_project, export_project_metadata
-from gui_utils import format_time
+from gui_utils import format_time, format_fps
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -51,6 +51,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.global_pause_button.setEnabled(False)
         self.global_pause_button.clicked.connect(self._on_global_pause)
         self.global_controls_layout.addWidget(self.global_pause_button)
+
+        self.global_frame_back_button = QtWidgets.QPushButton("All ◄ Frame")
+        self.global_frame_back_button.setEnabled(False)
+        self.global_frame_back_button.clicked.connect(self._on_global_frame_back)
+        self.global_controls_layout.addWidget(self.global_frame_back_button)
+
+        self.global_frame_forward_button = QtWidgets.QPushButton("Frame ► All")
+        self.global_frame_forward_button.setEnabled(False)
+        self.global_frame_forward_button.clicked.connect(self._on_global_frame_forward)
+        self.global_controls_layout.addWidget(self.global_frame_forward_button)
         
         self.global_controls_layout.addStretch()
         left_layout.addLayout(self.global_controls_layout)
@@ -198,7 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.statusLabel.setText(
                 f"Loaded: {self.project.name} | "
-                f"Primary video: {primary_video.name} ({primary_video.frame_count} frames, {primary_video.fps:.1f} fps) | "
+                f"Primary video: {primary_video.name} ({primary_video.frame_count} frames, {format_fps(primary_video.fps)} fps) | "
                 f"Sensor data: {', '.join(self.project.sensor_data.keys())}"
             )
             
@@ -266,6 +276,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         # Handle move-to-beginning requests from video displays
         self.video_player.move_to_beginning_requested.connect(self._on_move_to_beginning_requested)
+        self.video_player.move_to_end_requested.connect(self._on_move_to_end_requested)
         self.video_player.frame_changed.connect(self._on_frame_changed)
         self.video_container_layout.addWidget(self.video_player)
         
@@ -281,6 +292,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_button.setEnabled(True)
         self.global_play_button.setEnabled(True)
         self.global_pause_button.setEnabled(True)
+        self.global_frame_back_button.setEnabled(True)
+        self.global_frame_forward_button.setEnabled(True)
     
     def _update_video_visibility_controls(self):
         """Update video visibility checkboxes."""
@@ -337,6 +350,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Move the video to its trim start frame
         if video_id == 'primary':
             if self.project.primary_video and 'primary' in self.video_player.video_displays:
+                if self.video_player.video_displays['primary'].playing:
+                    self.video_player.video_displays['primary'].toggle_play()
                 start_frame = self.project.primary_video.start_frame
                 self.video_player.video_displays['primary'].set_frame(int(start_frame))
         else:
@@ -347,10 +362,44 @@ class MainWindow(QtWidgets.QMainWindow):
             if 0 <= idx < len(self.project.additional_videos):
                 vid = self.project.additional_videos[idx]
                 if video_id in self.video_player.video_displays:
+                    if self.video_player.video_displays[video_id].playing:
+                        self.video_player.video_displays[video_id].toggle_play()
                     start_frame = vid.start_frame
                     self.video_player.video_displays[video_id].set_frame(int(start_frame))
 
         # Update sync panel display (labels) and notify listeners
+        try:
+            self.sync_panel._update_display()
+            self.sync_panel.trim_changed.emit()
+        except Exception:
+            pass
+
+    def _on_move_to_end_requested(self, video_id: str) -> None:
+        """Handle move-to-end request from a specific video display only."""
+        if not self.video_player or not self.project:
+            return
+
+        if video_id == 'primary':
+            if self.project.primary_video and 'primary' in self.video_player.video_displays:
+                if self.video_player.video_displays['primary'].playing:
+                    self.video_player.video_displays['primary'].toggle_play()
+                end_frame = self.project.primary_video.end_frame
+                end_frame = self.project.primary_video.frame_count - 1 if end_frame is None else end_frame
+                self.video_player.video_displays['primary'].set_frame(int(end_frame))
+        else:
+            try:
+                idx = int(video_id.split('_', 1)[1])
+            except Exception:
+                return
+            if 0 <= idx < len(self.project.additional_videos):
+                vid = self.project.additional_videos[idx]
+                if video_id in self.video_player.video_displays:
+                    if self.video_player.video_displays[video_id].playing:
+                        self.video_player.video_displays[video_id].toggle_play()
+                    end_frame = vid.end_frame
+                    end_frame = vid.frame_count - 1 if end_frame is None else end_frame
+                    self.video_player.video_displays[video_id].set_frame(int(end_frame))
+
         try:
             self.sync_panel._update_display()
             self.sync_panel.trim_changed.emit()
@@ -373,6 +422,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle global pause all button."""
         if self.video_player:
             self.video_player.pause_all()
+
+    def _on_global_frame_back(self):
+        """Step all videos one frame backward simultaneously."""
+        if self.video_player:
+            self.video_player.step_all_frames(-1)
+
+    def _on_global_frame_forward(self):
+        """Step all videos one frame forward simultaneously."""
+        if self.video_player:
+            self.video_player.step_all_frames(1)
     
     def _on_export(self):
         """Handle export button click."""
@@ -436,56 +495,70 @@ class MainWindow(QtWidgets.QMainWindow):
                     'is_primary': False
                 })
             
-            # Build export preview message showing RESULTANT trimmed frames/seconds for all videos
-            msg_lines = ["Export Preview - Resultant Trimmed Videos:"]
-            msg_lines.append("=" * 85)
-            
-            for info in all_videos_info:
-                if info['is_primary']:
-                    msg_lines.append(f"{info['name']}: {info['target_frames']} frames ({info['target_seconds']:.3f}s at {info['fps']:.2f}fps)")
-                else:
-                    # For additional videos, show: source trimmed → delta → final exported
-                    source_str = f"{info['source_trimmed_frames']} frames ({info['source_trimmed_seconds']:.3f}s)"
-                    
-                    if info['delta_frames'] > 0:
-                        delta_str = f"+{info['delta_frames']} frames (+{info['delta_frames']/info['fps']:.3f}s padding)"
-                        arrow = " → padding → "
-                    elif info['delta_frames'] < 0:
-                        delta_str = f"{info['delta_frames']} frames ({info['delta_frames']/info['fps']:.3f}s truncation)"
-                        arrow = " → truncation → "
-                    else:
-                        delta_str = "no change"
-                        arrow = " → "
-                    
-                    final_str = f"{info['target_frames']} frames ({info['target_seconds']:.3f}s)"
-                    
-                    msg_lines.append(f"{info['name']} (at {info['fps']:.2f}fps):")
-                    msg_lines.append(f"  Trimmed source: {source_str}{arrow}Final: {final_str}")
-            
-            msg_lines.append("=" * 85)
-            msg_lines.append("")
-            msg_lines.append("All videos will be exported with the same time duration (seconds).")
-            msg_lines.append("Shorter videos will be padded with black frames; longer will be truncated.")
-            msg_lines.append("")
-            msg_lines.append("Proceed with export?")
-            
-            msg_text = "\n".join(msg_lines)
-            preview_box = QtWidgets.QMessageBox(self)
-            preview_box.setWindowTitle("Export Preview")
-            preview_box.setText(msg_text)
-            preview_box.setIcon(QtWidgets.QMessageBox.Question)
-            preview_box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            preview_box.setDefaultButton(QtWidgets.QMessageBox.Yes)
+            # ---- Build FPS-Sync preview text (only export mode) ------
+            def _build_preview() -> str:
+                lines = []
+                lines.append("Export Preview  —  FPS Sync Mode:")
+                lines.append("=" * 88)
+                lines.append(
+                    f"Primary (Video 1):  {primary_frame_count} frames  "
+                    f"({primary_duration_sec:.3f}s  at {format_fps(primary.fps)} fps)"
+                )
+                for info in all_videos_info[1:]:
+                    src_frames = info['source_trimmed_frames']
+                    src_sec    = info['source_trimmed_seconds']
+                    src_fps    = info['fps']
+                    adj_fps = src_frames / primary_duration_sec if primary_duration_sec > 0 else src_fps
+                    out_sec = src_frames / adj_fps if adj_fps > 0 else 0.0
+                    fps_delta = adj_fps - src_fps
+                    fps_delta_text = f"+{format_fps(abs(fps_delta))}" if fps_delta >= 0 else f"-{format_fps(abs(fps_delta))}"
+                    lines.append(
+                        f"{info['name']}  (source {format_fps(src_fps)} fps):  "
+                        f"{src_frames} frames ({src_sec:.3f}s)  →  output at {format_fps(adj_fps)} fps "
+                        f"({fps_delta_text} delta)  →  {out_sec:.3f}s"
+                    )
+                lines.append("=" * 88)
+                lines.append(
+                    "Output FPS is adjusted so that the selected trim frames are the exact\n"
+                    "first and last frames of each output video, with identical duration\n"
+                    "to the primary video.  No padding or truncation is used."
+                )
+                return "\n".join(lines)
 
+            # ---- Custom export dialog --------------------------------
+            export_dialog = QtWidgets.QDialog(self)
+            export_dialog.setWindowTitle("Export Preview")
+            export_dialog.setMinimumWidth(760)
+            dlg_layout = QtWidgets.QVBoxLayout(export_dialog)
+            dlg_layout.setSpacing(10)
+
+            # Preview text (monospaced)
+            preview_label = QtWidgets.QLabel(_build_preview())
+            preview_label.setWordWrap(False)
+            preview_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            font = QtGui.QFont("Courier New", 9)
+            preview_label.setFont(font)
+            dlg_layout.addWidget(preview_label)
+
+            # Gaze overlay checkbox
             overlay_checkbox = QtWidgets.QCheckBox("Create gaze overlay video (slower)")
             overlay_checkbox.setChecked(True)
-            preview_box.setCheckBox(overlay_checkbox)
+            dlg_layout.addWidget(overlay_checkbox)
 
-            reply = preview_box.exec_()
-            if reply != QtWidgets.QMessageBox.Yes:
+            # OK / Cancel buttons
+            btn_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            btn_box.button(QtWidgets.QDialogButtonBox.Ok).setText("Export")
+            btn_box.accepted.connect(export_dialog.accept)
+            btn_box.rejected.connect(export_dialog.reject)
+            dlg_layout.addWidget(btn_box)
+
+            if export_dialog.exec_() != QtWidgets.QDialog.Accepted:
                 return
 
             export_gaze_overlay = overlay_checkbox.isChecked()
+            use_sync_fps = True
 
             # Show progress dialog
             progress = QtWidgets.QProgressDialog(
@@ -499,6 +572,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.project,
                 Path(output_folder),
                 export_gaze_overlay=export_gaze_overlay,
+                sync_fps=use_sync_fps,
                 progress_callback=lambda msg: None  # Could update progress dialog here
             )
             
@@ -649,6 +723,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.export_button.setEnabled(False)
             self.global_play_button.setEnabled(False)
             self.global_pause_button.setEnabled(False)
+            self.global_frame_back_button.setEnabled(False)
+            self.global_frame_forward_button.setEnabled(False)
             
             self.statusLabel.setText("Ready. Load eye tracking data to begin.")
     

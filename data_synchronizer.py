@@ -144,10 +144,11 @@ def export_trimmed_video_ffmpeg(input_path: str, output_path: str, start_sec: fl
         # Add -fflags +genpts for more accurate frame count reporting
         cmd = [
             'ffmpeg',
-            '-ss', f'{start_sec:.6f}',  # Seek start position
+            '-ss', f'{start_sec:.9f}',  # Seek start position
             '-i', str(input_path),
-            '-t', f'{duration_sec:.6f}',  # Use duration
+            '-t', f'{duration_sec:.9f}',  # Use duration
             '-fflags', '+genpts',  # Generate presentation timestamps for accurate frame count
+            '-avoid_negative_ts', 'make_zero',  # Normalize output timeline to start at 0
             '-c:v', 'copy',  # Copy video stream unchanged (preserves original codec)
             '-c:a', 'copy',  # Copy audio stream unchanged (preserves original codec)
             '-y',  # Overwrite output
@@ -189,12 +190,18 @@ def export_trimmed_video_ffmpeg(input_path: str, output_path: str, start_sec: fl
 def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, start_sec: float,
                                          target_frames: int, fps: float, pad_frames: int = 0,
                                          target_bitrate_kbps: int | None = None,
-                                         constant_bitrate: bool = False) -> bool:
+                                         constant_bitrate: bool = False,
+                                         output_fps: float | None = None) -> bool:
     """
     Export trimmed video using FFmpeg re-encoding to guarantee frame creation when stream-copy
     seeking cannot hit the exact target reliably.
-    
-    Attempts to match the original codec and bitrate to minimize quality loss and file size increase.
+
+    When ``output_fps`` is supplied the output is written at that framerate instead of ``fps``.
+    This is used by FPS-Sync mode: the source trim range is extracted at the source FPS, then
+    re-declared at ``output_fps`` so the total duration matches the primary video exactly,
+    without padding or truncation.
+
+    Attempts to match the original codec and bitrate to minimise quality loss and file size.
 
     Returns:
         True if successful, False otherwise
@@ -210,38 +217,73 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             print(f"Error: Invalid target_frames ({target_frames}) or fps ({fps})")
             return False
 
-        # Probe original video for codec and bitrate information
-        original_bitrate = 5000
-        
+        # Probe original video for codec and bitrate information.
+        # Use a three-level probe: stream → container → file-size/duration.
+        source_bitrate_kbps = None
+
         try:
-            probe_cmd = [
+            # Level 1: stream-level bitrate (often N/A for H.264 in MP4)
+            probe_stream_cmd = [
                 'ffprobe', '-v', 'error', '-select_streams', 'v:0',
                 '-show_entries', 'stream=codec_name,bit_rate',
                 '-of', 'default=noprint_wrappers=1:nokey=1',
                 str(input_path)
             ]
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            probe_result = subprocess.run(probe_stream_cmd, capture_output=True, text=True, timeout=10)
             if probe_result.returncode == 0:
                 lines = [l.strip() for l in probe_result.stdout.splitlines() if l.strip()]
-                if len(lines) >= 2:
+                if lines:
                     codec_name = lines[0].lower()
-                    bitrate_str = lines[1]
-                    
                     if 'hevc' in codec_name or 'h265' in codec_name:
                         print("Original codec is HEVC (not Windows-compatible), converting to H.264")
-                    
-                    # Parse bitrate
-                    if bitrate_str.isdigit():
-                        original_bitrate = max(500, int(int(bitrate_str) / 1000))
-                    
-                    print(f"Detected original codec: {codec_name} (h264), bitrate: {original_bitrate} kbps")
+                if len(lines) >= 2 and lines[1].isdigit() and int(lines[1]) > 0:
+                    source_bitrate_kbps = max(500, int(int(lines[1]) / 1000))
         except Exception as e:
             print(f"Warning: Could not probe original codec: {e}")
 
-        effective_bitrate = max(500, int(target_bitrate_kbps or original_bitrate))
+        if source_bitrate_kbps is None:
+            # Level 2: container/format-level bitrate
+            try:
+                probe_fmt_cmd = [
+                    'ffprobe', '-v', 'error',
+                    '-show_entries', 'format=bit_rate',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    str(input_path)
+                ]
+                fmt_result = subprocess.run(probe_fmt_cmd, capture_output=True, text=True, timeout=10)
+                if fmt_result.returncode == 0:
+                    val = fmt_result.stdout.strip()
+                    if val.isdigit() and int(val) > 0:
+                        total_kbps = max(500, int(int(val) / 1000))
+                        source_bitrate_kbps = max(300, total_kbps - 128)  # subtract audio overhead
+            except Exception:
+                pass
+
+        if source_bitrate_kbps is None:
+            # Level 3: derive from file size and duration
+            try:
+                dur_sec = target_frames / fps  # rough estimate
+                file_bytes = Path(input_path).stat().st_size
+                if dur_sec > 0 and file_bytes > 0:
+                    total_kbps = int((file_bytes * 8) / (dur_sec * 1000))
+                    source_bitrate_kbps = max(300, total_kbps - 128)
+            except Exception:
+                pass
+
+        if source_bitrate_kbps is None:
+            source_bitrate_kbps = 5000  # conservative last-resort fallback
+
+        # Cap effective_bitrate to the source so the output is never larger than the source.
+        # If the caller requested a specific bitrate it still must not exceed the source.
+        requested_kbps = int(target_bitrate_kbps) if target_bitrate_kbps else source_bitrate_kbps
+        effective_bitrate = max(500, min(requested_kbps, source_bitrate_kbps))
+        print(f"Source bitrate: {source_bitrate_kbps} kbps, effective encode bitrate: {effective_bitrate} kbps")
         output_file = Path(output_path)
         target_duration_sec = target_frames / fps
         timeout_sec = int(max(1800, min(14400, target_duration_sec * 6 + 600)))
+
+        # Effective output FPS: use override when provided (FPS-Sync mode), else keep source fps
+        effective_out_fps = output_fps if (output_fps is not None and output_fps > 0) else fps
 
         base_cmd = [
             'ffmpeg',
@@ -249,21 +291,21 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             '-nostats',
             '-err_detect', 'ignore_err',
             '-fflags', '+discardcorrupt',
-            '-ss', f'{start_sec:.6f}',
+            '-ss', f'{start_sec:.9f}',
             '-i', str(input_path),
         ]
 
-        video_filter = f'fps={fps:.6f}'
+        video_filter = f'fps={effective_out_fps:.9f}'
         if pad_frames > 0:
-            pad_seconds = pad_frames / fps
-            video_filter = f'{video_filter},tpad=stop_mode=add:stop_duration={pad_seconds:.6f}'
+            pad_seconds = pad_frames / effective_out_fps
+            video_filter = f'{video_filter},tpad=stop_mode=add:stop_duration={pad_seconds:.9f}'
 
         encoder_candidates = []
         if _ffmpeg_has_encoder('h264_nvenc'):
             encoder_candidates.append('h264_nvenc')
         encoder_candidates.append('libx264')
 
-        maxrate_vbr = int(effective_bitrate * 1.15)
+        maxrate_vbr = effective_bitrate  # hard cap: never exceed source bitrate
         bufsize = max(effective_bitrate * 2, 1000)
         last_error = ""
 
@@ -272,9 +314,8 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             cmd += [
                 '-vf', video_filter,
                 '-frames:v', str(int(target_frames)),
-                '-r', f'{fps:.6f}',
+                '-r', f'{effective_out_fps:.9f}',
                 '-c:v', video_encoder,
-                '-b:v', f'{effective_bitrate}k',
                 '-pix_fmt', 'yuv420p',
             ]
 
@@ -283,27 +324,34 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
                 if constant_bitrate:
                     cmd += [
                         '-rc', 'cbr',
+                        '-b:v', f'{effective_bitrate}k',
                         '-minrate', f'{effective_bitrate}k',
                         '-maxrate', f'{effective_bitrate}k',
                         '-bufsize', f'{bufsize}k',
                     ]
                 else:
+                    # CRF-like quality control with hard bitrate ceiling
                     cmd += [
                         '-rc', 'vbr',
+                        '-cq', '23',
                         '-maxrate', f'{maxrate_vbr}k',
                         '-bufsize', f'{bufsize}k',
                     ]
             else:
-                cmd += ['-preset', 'faster']
                 if constant_bitrate:
                     cmd += [
+                        '-preset', 'faster',
+                        '-b:v', f'{effective_bitrate}k',
                         '-minrate', f'{effective_bitrate}k',
                         '-maxrate', f'{effective_bitrate}k',
                         '-bufsize', f'{bufsize}k',
                         '-x264-params', 'nal-hrd=cbr:force-cfr=1',
                     ]
                 else:
+                    # CRF 23 (default quality) with maxrate cap so output never inflates
                     cmd += [
+                        '-preset', 'faster',
+                        '-crf', '23',
                         '-maxrate', f'{maxrate_vbr}k',
                         '-bufsize', f'{bufsize}k',
                     ]
@@ -311,6 +359,7 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             cmd += [
                 '-c:a', 'aac',
                 '-b:a', '128k',
+                '-avoid_negative_ts', 'make_zero',
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path),
