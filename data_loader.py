@@ -97,8 +97,14 @@ def find_timestamp_columns(df: pd.DataFrame) -> Tuple[Optional[str], Optional[st
     return timestamp_col, start_col, end_col
 
 
-def load_video(video_path: Path, is_primary: bool = False) -> VideoData:
-    """Load video file and extract metadata, world_timestamps if available."""
+def load_video(video_path: Path, is_primary: bool = False, camera_type: Optional[str] = None) -> VideoData:
+    """Load video file and extract metadata, world_timestamps if available.
+    
+    Args:
+        video_path: Path to video file
+        is_primary: True if this is the primary (eye tracking) video
+        camera_type: Camera identifier. If None and is_primary=True, defaults to "eyes"
+    """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise IOError(f"Could not open video: {video_path}")
@@ -128,6 +134,9 @@ def load_video(video_path: Path, is_primary: bool = False) -> VideoData:
             except Exception as e:
                 print(f"Warning: Could not load world_timestamps: {e}")
     
+    # Set camera type: primary videos always use "eyes", others use provided value or None
+    final_camera_type = "eyes" if is_primary else camera_type
+    
     return VideoData(
         name=video_path.stem,
         file_path=video_path,
@@ -139,7 +148,8 @@ def load_video(video_path: Path, is_primary: bool = False) -> VideoData:
         duration=duration,
         world_timestamps=world_ts,
         start_frame=0,
-        end_frame=frame_count - 1
+        end_frame=frame_count - 1,
+        camera_type=final_camera_type
     )
 
 

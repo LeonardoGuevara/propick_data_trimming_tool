@@ -4,7 +4,7 @@ Synchronization and trimming control panel widget.
 from PyQt5 import QtCore, QtGui, QtWidgets
 from typing import Optional, Callable
 from models import ProjectData, VideoData
-from gui_utils import format_time, frames_to_seconds
+from gui_utils import format_time, frames_to_seconds, video_display_name
 
 
 class SyncTrimPanel(QtWidgets.QGroupBox):
@@ -35,7 +35,7 @@ class SyncTrimPanel(QtWidgets.QGroupBox):
             return
         
         # Primary video trim section
-        primary_group = QtWidgets.QGroupBox("Primary Video (Eye Tracking)", self)
+        primary_group = QtWidgets.QGroupBox(video_display_name(self.project.primary_video), self)
         primary_layout = QtWidgets.QVBoxLayout(primary_group)
         
         # Start frame controls
@@ -82,7 +82,7 @@ class SyncTrimPanel(QtWidgets.QGroupBox):
             self.additional_video_widgets = {}
             for i, video in enumerate(self.project.additional_videos):
                 # Create expandable section for each video
-                video_section = QtWidgets.QGroupBox(f"Video {i+2}: {video.name}", self)
+                video_section = QtWidgets.QGroupBox(video_display_name(video), self)
                 video_section_layout = QtWidgets.QVBoxLayout(video_section)
                 
                 # Trim start controls

@@ -1,8 +1,9 @@
 """
 Utility functions for the GUI.
 """
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
+from PyQt5 import QtWidgets
 
 
 def format_time(total_seconds: float) -> str:
@@ -106,3 +107,171 @@ def scale_coordinates(coords: tuple, from_size: tuple, to_size: tuple) -> tuple:
     scale_y = to_size[1] / from_size[1]
     
     return (int(coords[0] * scale_x), int(coords[1] * scale_y))
+
+
+def video_display_name(video) -> str:
+    """Return a consistent camera-based label for UI display."""
+    camera = (getattr(video, 'camera_type', None) or ("eyes" if getattr(video, 'is_primary', False) else "unknown")).strip()
+    return f"{camera} ({video.name})"
+
+
+class CameraSelectionDialog(QtWidgets.QDialog):
+    """Dialog for selecting camera type for a video."""
+
+    CAMERA_OPTIONS = ["chest", "trolley_picker", "trolley_crop", "custom"]
+
+    def __init__(self, video_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Camera Type")
+        self.setMinimumWidth(400)
+        self.video_name = video_name
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        info_label = QtWidgets.QLabel(
+            f"Select camera type for: {self.video_name}\n"
+            f"(This parameter will be used in the exported filename)"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        layout.addSpacing(10)
+
+        camera_layout = QtWidgets.QVBoxLayout()
+        camera_layout.addWidget(QtWidgets.QLabel("Camera:"))
+
+        self.camera_group = QtWidgets.QButtonGroup(self)
+        for index, option in enumerate(self.CAMERA_OPTIONS):
+            radio = QtWidgets.QRadioButton(option)
+            self.camera_group.addButton(radio, index)
+            camera_layout.addWidget(radio)
+            if index == 0:
+                radio.setChecked(True)
+
+        layout.addLayout(camera_layout)
+
+        custom_layout = QtWidgets.QHBoxLayout()
+        custom_layout.addWidget(QtWidgets.QLabel("Custom value (if selected):"))
+        self.custom_input = QtWidgets.QLineEdit()
+        self.custom_input.setPlaceholderText("e.g., side_view, overhead, etc.")
+        self.custom_input.setEnabled(False)
+        custom_layout.addWidget(self.custom_input)
+        layout.addLayout(custom_layout)
+
+        def on_camera_changed():
+            self.custom_input.setEnabled(self.camera_group.checkedId() == 3)
+
+        for radio in self.camera_group.buttons():
+            radio.toggled.connect(on_camera_changed)
+
+        layout.addSpacing(10)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        ok_button = QtWidgets.QPushButton("OK")
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_button)
+        btn_layout.addWidget(cancel_button)
+        layout.addLayout(btn_layout)
+
+    def get_camera_type(self) -> Optional[str]:
+        if self.camera_group.checkedId() == 3:
+            custom_value = self.custom_input.text().strip()
+            if not custom_value:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Validation Error",
+                    "Please enter a custom camera value.",
+                )
+                return None
+            return custom_value
+
+        index = self.camera_group.checkedId()
+        if 0 <= index < len(self.CAMERA_OPTIONS):
+            return self.CAMERA_OPTIONS[index]
+        return None
+
+
+class ExportNamingDialog(QtWidgets.QDialog):
+    """Dialog for entering custom file naming parameters."""
+
+    CONDITION_OPTIONS = [
+        "left_direction",
+        "right_direction",
+        "no_intervention",
+        "generic_intervention",
+        "personalised_intervention",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export File Naming")
+        self.setMinimumWidth(400)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        info_label = QtWidgets.QLabel(
+            "Provide naming parameters for exported files "
+            "(name format: <pickerID>_<camera>_<condition>.mp4)"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        layout.addSpacing(10)
+
+        picker_layout = QtWidgets.QHBoxLayout()
+        picker_layout.addWidget(QtWidgets.QLabel("Picker ID:"))
+        self.picker_id_input = QtWidgets.QLineEdit()
+        self.picker_id_input.setPlaceholderText("e.g., P001, Picker_01, etc.")
+        picker_layout.addWidget(self.picker_id_input)
+        layout.addLayout(picker_layout)
+
+        condition_layout = QtWidgets.QHBoxLayout()
+        condition_layout.addWidget(QtWidgets.QLabel("Condition:"))
+        self.condition_combo = QtWidgets.QComboBox()
+        self.condition_combo.addItems(self.CONDITION_OPTIONS)
+        self.condition_combo.setEditable(False)
+        condition_layout.addWidget(self.condition_combo)
+        layout.addLayout(condition_layout)
+
+        custom_condition_layout = QtWidgets.QHBoxLayout()
+        custom_condition_layout.addWidget(QtWidgets.QLabel("Custom condition (optional):"))
+        self.custom_condition_input = QtWidgets.QLineEdit()
+        self.custom_condition_input.setPlaceholderText("Type custom condition here")
+        custom_condition_layout.addWidget(self.custom_condition_input)
+        layout.addLayout(custom_condition_layout)
+
+        layout.addSpacing(10)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        ok_button = QtWidgets.QPushButton("Export")
+        cancel_button = QtWidgets.QPushButton("Cancel")
+        ok_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_button)
+        btn_layout.addWidget(cancel_button)
+        layout.addLayout(btn_layout)
+
+    def get_parameters(self) -> Optional[Tuple[str, str]]:
+        picker_id = self.picker_id_input.text().strip()
+        custom_condition = self.custom_condition_input.text().strip()
+        condition = custom_condition if custom_condition else self.condition_combo.currentText().strip()
+
+        if not picker_id:
+            QtWidgets.QMessageBox.warning(self, "Validation Error", "Picker ID cannot be empty.")
+            return None
+
+        if not condition:
+            QtWidgets.QMessageBox.warning(self, "Validation Error", "Condition must be selected.")
+            return None
+
+        return picker_id, condition

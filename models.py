@@ -45,6 +45,7 @@ class VideoData:
     offset_frames: int = 0  # Frame offset relative to primary video (for sync)
     start_frame: int = 0  # Frame where trimming starts
     end_frame: Optional[int] = None  # Frame where trimming ends
+    camera_type: Optional[str] = None  # Camera identifier: "eyes" for primary, or user-specified for additional
     
     def get_frame_timestamp(self, frame_idx: int) -> int:
         """Get nanosecond timestamp for a frame."""

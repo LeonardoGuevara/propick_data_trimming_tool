@@ -1,7 +1,7 @@
 """
 Video and sensor data synchronization utilities.
 """
-from typing import Tuple
+from typing import Tuple, Optional, Dict, Any
 import numpy as np
 import pandas as pd
 from models import VideoData, SensorData, ProjectData
@@ -35,6 +35,39 @@ def _ffmpeg_has_encoder(encoder_name: str) -> bool:
     except Exception:
         _FFMPEG_ENCODER_CACHE[encoder_name] = False
         return False
+
+
+def _classify_ffmpeg_failure(stderr_text: str, timed_out: bool = False) -> str:
+    """Return a stable diagnostic category for FFmpeg failures."""
+    if timed_out:
+        return "timeout"
+
+    text = (stderr_text or "").lower()
+    if not text:
+        return "unknown"
+
+    if "permission denied" in text or "access is denied" in text:
+        return "filesystem_permission"
+    if "no space left on device" in text or "disk full" in text:
+        return "filesystem_space"
+    if "cannot open" in text or "error opening output" in text:
+        return "filesystem_output_open"
+    if "no such file or directory" in text:
+        return "filesystem_path"
+
+    if "no capable devices found" in text or "nvenc" in text and "cannot" in text:
+        return "nvenc_unavailable"
+    if "too many concurrent sessions" in text:
+        return "nvenc_session_limit"
+    if "cuda" in text and "error" in text:
+        return "gpu_runtime_error"
+
+    if "invalid argument" in text:
+        return "invalid_arguments"
+    if "error while decoding" in text or "invalid data found" in text or "corrupt" in text:
+        return "decode_error"
+
+    return "ffmpeg_error"
 
 
 def synchronize_additional_video(primary_video: VideoData, additional_video: VideoData, 
@@ -191,17 +224,19 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
                                          target_frames: int, fps: float, pad_frames: int = 0,
                                          target_bitrate_kbps: int | None = None,
                                          constant_bitrate: bool = False,
-                                         output_fps: float | None = None) -> bool:
+                                         output_fps: float | None = None,
+                                         diagnostics: Optional[Dict[str, Any]] = None) -> bool:
     """
     Export trimmed video using FFmpeg re-encoding to guarantee frame creation when stream-copy
     seeking cannot hit the exact target reliably.
 
-    When ``output_fps`` is supplied the output is written at that framerate instead of ``fps``.
-    This is used by FPS-Sync mode: the source trim range is extracted at the source FPS, then
-    re-declared at ``output_fps`` so the total duration matches the primary video exactly,
-    without padding or truncation.
+    When ``output_fps`` is supplied the selected source frames are preserved exactly and only
+    their timing is changed so the total duration matches the primary video exactly.
 
     Attempts to match the original codec and bitrate to minimise quality loss and file size.
+
+    Args:
+        diagnostics: Optional dict populated with failure/success details for UI logging.
 
     Returns:
         True if successful, False otherwise
@@ -209,16 +244,41 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
     import subprocess
     from pathlib import Path
 
+    diag = diagnostics if isinstance(diagnostics, dict) else None
+    if diag is not None:
+        diag.clear()
+        diag.update({
+            'status': 'starting',
+            'input_path': str(input_path),
+            'output_path': str(output_path),
+            'start_sec': float(start_sec),
+            'target_frames': int(target_frames),
+            'source_fps': float(fps),
+            'attempts': [],
+        })
+
     try:
         if not Path(input_path).exists():
             print(f"Error: Input file not found: {input_path}")
+            if diag is not None:
+                diag.update({
+                    'status': 'failed',
+                    'failure_category': 'input_missing',
+                    'last_error': f'Input file not found: {input_path}',
+                })
             return False
         if target_frames <= 0 or fps <= 0:
             print(f"Error: Invalid target_frames ({target_frames}) or fps ({fps})")
+            if diag is not None:
+                diag.update({
+                    'status': 'failed',
+                    'failure_category': 'invalid_parameters',
+                    'last_error': f'Invalid target_frames ({target_frames}) or fps ({fps})',
+                })
             return False
 
         # Probe original video for codec and bitrate information.
-        # Use a three-level probe: stream → container → file-size/duration.
+        # Use a three-level probe: stream -> container -> file-size/duration.
         source_bitrate_kbps = None
 
         try:
@@ -236,6 +296,8 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
                     codec_name = lines[0].lower()
                     if 'hevc' in codec_name or 'h265' in codec_name:
                         print("Original codec is HEVC (not Windows-compatible), converting to H.264")
+                        if diag is not None:
+                            diag['input_codec'] = codec_name
                 if len(lines) >= 2 and lines[1].isdigit() and int(lines[1]) > 0:
                     source_bitrate_kbps = max(500, int(int(lines[1]) / 1000))
         except Exception as e:
@@ -279,11 +341,26 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
         effective_bitrate = max(500, min(requested_kbps, source_bitrate_kbps))
         print(f"Source bitrate: {source_bitrate_kbps} kbps, effective encode bitrate: {effective_bitrate} kbps")
         output_file = Path(output_path)
-        target_duration_sec = target_frames / fps
-        timeout_sec = int(max(1800, min(14400, target_duration_sec * 6 + 600)))
 
         # Effective output FPS: use override when provided (FPS-Sync mode), else keep source fps
         effective_out_fps = output_fps if (output_fps is not None and output_fps > 0) else fps
+        sync_retime_mode = output_fps is not None and output_fps > 0 and abs(effective_out_fps - fps) > 1e-6
+
+        source_segment_duration_sec = target_frames / fps
+        target_duration_sec = target_frames / effective_out_fps if (output_fps is not None and output_fps > 0) else source_segment_duration_sec
+        timeout_sec = int(max(1800, min(14400, target_duration_sec * 6 + 600)))
+
+        if sync_retime_mode:
+            # PTS-STARTPTS normalises the first decoded frame's timestamp to 0 before
+            # scaling, so setpts works correctly for any source codec/PTS offset.
+            pts_scale = fps / effective_out_fps
+            video_filter = f'setpts={pts_scale:.12f}*(PTS-STARTPTS)'
+        else:
+            video_filter = f'fps={effective_out_fps:.9f}'
+
+        if pad_frames > 0:
+            pad_seconds = pad_frames / effective_out_fps
+            video_filter = f'{video_filter},tpad=stop_mode=add:stop_duration={pad_seconds:.9f}'
 
         base_cmd = [
             'ffmpeg',
@@ -292,13 +369,9 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             '-err_detect', 'ignore_err',
             '-fflags', '+discardcorrupt',
             '-ss', f'{start_sec:.9f}',
+            '-t', f'{source_segment_duration_sec:.9f}',
             '-i', str(input_path),
         ]
-
-        video_filter = f'fps={effective_out_fps:.9f}'
-        if pad_frames > 0:
-            pad_seconds = pad_frames / effective_out_fps
-            video_filter = f'{video_filter},tpad=stop_mode=add:stop_duration={pad_seconds:.9f}'
 
         encoder_candidates = []
         if _ffmpeg_has_encoder('h264_nvenc'):
@@ -308,6 +381,21 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
         maxrate_vbr = effective_bitrate  # hard cap: never exceed source bitrate
         bufsize = max(effective_bitrate * 2, 1000)
         last_error = ""
+        last_failure_category = "unknown"
+
+        if diag is not None:
+            diag.update({
+                'status': 'encoding',
+                'effective_out_fps': float(effective_out_fps),
+                'sync_retime_mode': bool(sync_retime_mode),
+                'source_segment_duration_sec': float(source_segment_duration_sec),
+                'target_duration_sec': float(target_duration_sec),
+                'source_bitrate_kbps': int(source_bitrate_kbps),
+                'effective_bitrate_kbps': int(effective_bitrate),
+                'encoder_candidates': list(encoder_candidates),
+                'video_filter': video_filter,
+                'timeout_sec': int(timeout_sec),
+            })
 
         for video_encoder in encoder_candidates:
             cmd = list(base_cmd)
@@ -356,19 +444,43 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
                         '-bufsize', f'{bufsize}k',
                     ]
 
-            cmd += [
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-avoid_negative_ts', 'make_zero',
-                '-movflags', '+faststart',
-                '-y',
-                str(output_path),
-            ]
+            if sync_retime_mode:
+                # Audio cannot stay aligned when playback speed changes unless it is time-stretched.
+                # To keep exact frames, exact duration, and reasonable file size, omit audio.
+                cmd += [
+                    '-an',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path),
+                ]
+            else:
+                cmd += [
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path),
+                ]
+
+            attempt_diag = {
+                'encoder': video_encoder,
+                'command': ' '.join(cmd),
+            }
+            if diag is not None:
+                diag['attempts'].append(attempt_diag)
 
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
             except subprocess.TimeoutExpired:
                 last_error = f"encoder {video_encoder} timed out after {timeout_sec}s"
+                last_failure_category = _classify_ffmpeg_failure(last_error, timed_out=True)
+                attempt_diag.update({
+                    'status': 'timeout',
+                    'failure_category': last_failure_category,
+                    'stderr': last_error,
+                })
                 try:
                     output_file.unlink(missing_ok=True)
                 except Exception:
@@ -376,7 +488,15 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
                 continue
 
             if result.returncode != 0:
-                last_error = (result.stderr or '')[:500]
+                stderr_text = (result.stderr or '').strip()
+                last_error = stderr_text[:1200]
+                last_failure_category = _classify_ffmpeg_failure(stderr_text)
+                attempt_diag.update({
+                    'status': 'failed',
+                    'returncode': int(result.returncode),
+                    'failure_category': last_failure_category,
+                    'stderr': stderr_text[:4000],
+                })
                 try:
                     output_file.unlink(missing_ok=True)
                 except Exception:
@@ -386,9 +506,26 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
             if output_file.exists() and output_file.stat().st_size >= 1000:
                 if video_encoder == 'h264_nvenc':
                     print("FFmpeg re-encode used NVENC acceleration")
+                attempt_diag.update({
+                    'status': 'success',
+                    'returncode': int(result.returncode),
+                    'output_size_bytes': int(output_file.stat().st_size),
+                })
+                if diag is not None:
+                    diag.update({
+                        'status': 'success',
+                        'selected_encoder': video_encoder,
+                        'output_size_bytes': int(output_file.stat().st_size),
+                    })
                 return True
 
             last_error = "output missing or too small"
+            last_failure_category = "output_invalid"
+            attempt_diag.update({
+                'status': 'failed',
+                'failure_category': last_failure_category,
+                'stderr': last_error,
+            })
             try:
                 output_file.unlink(missing_ok=True)
             except Exception:
@@ -397,9 +534,21 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
         print("FFmpeg re-encode error: all encoder attempts failed")
         if last_error:
             print(f"  stderr: {last_error}")
+        if diag is not None:
+            diag.update({
+                'status': 'failed',
+                'failure_category': last_failure_category,
+                'last_error': last_error,
+            })
         return False
     except Exception as e:
         print(f"FFmpeg re-encode error: {type(e).__name__}: {e}")
+        if diag is not None:
+            diag.update({
+                'status': 'failed',
+                'failure_category': 'python_exception',
+                'last_error': f'{type(e).__name__}: {e}',
+            })
         try:
             from pathlib import Path
             Path(output_path).unlink(missing_ok=True)
@@ -408,8 +557,9 @@ def export_trimmed_video_ffmpeg_reencode(input_path: str, output_path: str, star
         return False
 
 
-def export_trimmed_video_opencv(input_path: str, output_path: str, start_frame: int, 
-                                 end_frame: int, fps: float, target_frame_count: int = None) -> tuple:
+def export_trimmed_video_opencv(input_path: str, output_path: str, start_frame: int,
+                                 end_frame: int, fps: float, target_frame_count: int = None,
+                                 output_fps: float = None) -> tuple:
     """
     Export trimmed video using OpenCV (slower, larger file, but always available).
     Each frame is explicitly read from the specified range to ensure trimming works.
@@ -446,16 +596,18 @@ def export_trimmed_video_opencv(input_path: str, output_path: str, start_frame: 
             cap.release()
             return False
         
-        print(f"OpenCV export: input={input_path}, output={output_path}, reading frames {start_frame}-{end_frame} (total {end_frame - start_frame + 1} frames) from {total_frames} total, fps={fps}, target_frame_count={target_frame_count}")
+        effective_fps = output_fps if (output_fps is not None and output_fps > 0) else fps
+
+        print(f"OpenCV export: input={input_path}, output={output_path}, reading frames {start_frame}-{end_frame} (total {end_frame - start_frame + 1} frames) from {total_frames} total, fps={effective_fps}, target_frame_count={target_frame_count}")
         
         # Create output video writer
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        out = cv2.VideoWriter(output_path, fourcc, effective_fps, (width, height))
         
         if not out.isOpened():
             print(f"Warning: mp4v codec failed, trying MJPEG fallback")
             fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(output_path, fourcc, effective_fps, (width, height))
         
         if not out.isOpened():
             print(f"Error: Could not create output video writer for {output_path}")

@@ -2,7 +2,7 @@
 Data export utilities for saving trimmed videos and sensor data.
 """
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import pandas as pd
 import os
 import shutil
@@ -12,9 +12,90 @@ from models import ProjectData, VideoData, SensorData
 from data_synchronizer import (
     export_trimmed_video_ffmpeg,
     export_trimmed_video_ffmpeg_reencode,
-    export_trimmed_video_opencv,
     create_gaze_overlay_video,
 )
+
+
+SENSOR_EXPORT_NAME_MAP = {
+    'gaze': 'gaze_positions',
+    'world_timestamps': 'timestamps',
+}
+
+
+def _sanitize_filename_part(value: Optional[str], default: str = "unknown") -> str:
+    """Return a filesystem-safe filename part."""
+    raw = (value or '').strip()
+    raw = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', raw)
+    raw = re.sub(r'\s+', '_', raw)
+    raw = raw.strip('._')
+    return raw or default
+
+
+def _sensor_export_name(sensor_name: str) -> str:
+    """Map internal sensor keys to exported names."""
+    return SENSOR_EXPORT_NAME_MAP.get(sensor_name, sensor_name)
+
+
+def _build_video_filename(video: VideoData, picker_id: str, condition: str) -> str:
+    """Build <pickerID>_<camera>_<condition>.mp4 filename."""
+    safe_picker = _sanitize_filename_part(picker_id)
+    safe_condition = _sanitize_filename_part(condition)
+    safe_camera = _sanitize_filename_part(video.camera_type or ("eyes" if video.is_primary else "unknown"))
+    return f"{safe_picker}_{safe_camera}_{safe_condition}.mp4"
+
+
+def _build_sensor_filename(picker_id: str, condition: str, sensor_name: str) -> str:
+    """Build <pickerID>_eyes_<eye_tracking_data>_<condition>.csv filename."""
+    safe_picker = _sanitize_filename_part(picker_id)
+    safe_condition = _sanitize_filename_part(condition)
+    safe_sensor = _sanitize_filename_part(_sensor_export_name(sensor_name))
+    return f"{safe_picker}_eyes_{safe_sensor}_{safe_condition}.csv"
+
+
+def _build_metadata_filename(condition: str) -> str:
+    """Build export metadata filename with condition suffix."""
+    safe_condition = _sanitize_filename_part(condition, default='unknown_condition')
+    return f"export_metadata_{safe_condition}.json"
+
+
+def preview_export_file_paths(project: ProjectData,
+                              output_folder: Path,
+                              picker_id: str,
+                              condition: str,
+                              export_gaze_overlay: bool = True,
+                              enabled_video_indices: Optional[List[int]] = None) -> Dict[str, Path]:
+    """Compute deterministic output paths for conflict checks before export."""
+    paths: Dict[str, Path] = {}
+    output_folder = Path(output_folder)
+
+    if not project.primary_video:
+        return paths
+
+    export_primary = enabled_video_indices is None or 0 in enabled_video_indices
+    primary = project.primary_video
+
+    if export_primary:
+        paths['primary_video'] = output_folder / _build_video_filename(primary, picker_id, condition)
+        if export_gaze_overlay and 'gaze' in project.sensor_data:
+            overlay_name = _build_video_filename(primary, picker_id, condition).replace('.mp4', '_gaze_overlay.mp4')
+            paths['gaze_overlay_video'] = output_folder / overlay_name
+
+        # Sensors are only exported when primary is selected.
+        for sensor_name in project.sensor_data.keys():
+            paths[f'sensor_{sensor_name}'] = output_folder / _build_sensor_filename(
+                picker_id,
+                condition,
+                sensor_name,
+            )
+
+    for i, video in enumerate(project.additional_videos):
+        video_index = i + 1
+        if enabled_video_indices is not None and video_index not in enabled_video_indices:
+            continue
+        paths[f'additional_video_{i+1}'] = output_folder / _build_video_filename(video, picker_id, condition)
+
+    paths['metadata'] = output_folder / _build_metadata_filename(condition)
+    return paths
 
 
 def safe_output_path(base_path: Path, suffix: str = "_trimmed") -> Path:
@@ -209,9 +290,24 @@ def _is_valid_video_output(file_path: Path) -> bool:
 
 def export_project(project: ProjectData, output_folder: Path, 
                    export_gaze_overlay: bool = True,
-                   sync_fps: bool = False,
-                   progress_callback=None) -> Dict[str, str]:
-    """Export trimmed videos and sensor data."""
+                   progress_callback=None,
+                   picker_id: Optional[str] = None,
+                   condition: Optional[str] = None,
+                   enabled_video_indices: Optional[list] = None,
+                   existing_file_policy: str = "overwrite") -> Dict[str, str]:
+    """Export trimmed videos and sensor data.
+    
+    Args:
+        project: ProjectData with all loaded media
+        output_folder: Output directory
+        export_gaze_overlay: Whether to create gaze overlay video
+        progress_callback: Callback for progress messages
+        picker_id: Picker ID for naming (e.g., "P001")
+        condition: Condition for naming (e.g., "left_direction")
+        enabled_video_indices: List of enabled video indices (None = export all).
+                              Index 0 is primary video, 1+ are additional videos.
+        existing_file_policy: How to handle existing files: "overwrite" or "skip".
+    """
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     results = {}
@@ -221,42 +317,138 @@ def export_project(project: ProjectData, output_folder: Path,
             progress_callback(msg)
         print(msg)
 
+    def _generate_custom_filename(video: VideoData, is_sensor: bool = False, 
+                                   sensor_type: Optional[str] = None) -> str:
+        """Generate custom filename based on picker_id, camera, condition.
+        
+        For videos: <pickerID>_<camera>_<condition>.mp4
+        For sensors: <pickerID>_<camera>_<sensor_type>_<condition>.csv
+        """
+        if not picker_id or not condition:
+            # Fallback to original names if parameters not provided
+            return video.name
+        
+        if is_sensor and sensor_type:
+            return _build_sensor_filename(picker_id, condition, sensor_type)
+        return _build_video_filename(video, picker_id, condition)
+
     def _get_frame_count(path: Path):
         try:
+            cmd = [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=nb_frames',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                values = [line.strip() for line in (result.stdout or '').splitlines() if line.strip()]
+                for value in values:
+                    if value.isdigit() and int(value) > 0:
+                        return int(value)
+
+            count_cmd = [
+                'ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+                '-show_entries', 'stream=nb_read_frames',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(path),
+            ]
+            count_result = subprocess.run(count_cmd, capture_output=True, text=True, timeout=60)
+            if count_result.returncode == 0:
+                values = [line.strip() for line in (count_result.stdout or '').splitlines() if line.strip()]
+                for value in values:
+                    if value.isdigit() and int(value) > 0:
+                        return int(value)
+
             import cv2
             cap = cv2.VideoCapture(str(path))
             count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             cap.release()
-            return count
+            return count if count > 0 else None
         except Exception:
             return None
 
     def _get_duration_sec(path: Path):
+        """Return video duration, preferring stream duration over container duration.
+
+        MP4 container duration can be slightly longer than the actual video stream because of
+        muxing metadata/track offsets. That breaks FPS-sync validation for otherwise correct
+        outputs, so the stream duration is the primary source of truth.
+        """
         try:
             cmd = [
-                'ffprobe', '-v', 'error',
-                '-show_entries', 'format=duration',
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=duration:format=duration',
                 '-of', 'default=noprint_wrappers=1:nokey=1',
                 str(path),
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
             if result.returncode != 0:
                 return None
-            value = (result.stdout or '').strip().splitlines()
-            if not value:
+
+            values = [line.strip() for line in (result.stdout or '').splitlines() if line.strip()]
+            for value in values:
+                try:
+                    duration = float(value)
+                    if duration > 0:
+                        return duration
+                except Exception:
+                    continue
+            return None
+        except Exception:
+            return None
+
+    def _get_output_fps(path: Path):
+        """Read output FPS from ffprobe stream rate."""
+        try:
+            cmd = [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=avg_frame_rate,r_frame_rate',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode != 0:
                 return None
-            return float(value[0])
+            lines = [line.strip() for line in (result.stdout or '').splitlines() if line.strip()]
+            for candidate in lines:
+                parsed = _parse_fps_fraction(candidate)
+                if parsed is not None and parsed > 0:
+                    return parsed
+            return None
         except Exception:
             return None
 
     def _is_timing_match(path: Path, expected_frames: int, expected_fps: float,
                          expected_duration_sec: Optional[float] = None,
-                         frame_tolerance: int = 2) -> bool:
+                         frame_tolerance: int = 2,
+                         diagnostics: Optional[Dict[str, object]] = None) -> bool:
+        diag = diagnostics if isinstance(diagnostics, dict) else None
+        if diag is not None:
+            diag.clear()
+            diag.update({
+                'path': str(path),
+                'expected_frames': int(expected_frames),
+                'expected_fps': float(expected_fps) if expected_fps is not None else None,
+                'expected_duration_sec': float(expected_duration_sec) if expected_duration_sec is not None else None,
+                'frame_tolerance': int(frame_tolerance),
+            })
+
         if not _is_valid_video_output(path):
+            if diag is not None:
+                diag.update({'result': False, 'failure': 'invalid_output'})
             return False
 
         out_frames = _get_frame_count(path)
-        if out_frames is not None and abs(out_frames - expected_frames) <= frame_tolerance:
+        frame_match = (out_frames is None) or (abs(out_frames - expected_frames) <= frame_tolerance)
+        if diag is not None:
+            diag['out_frames'] = out_frames
+            diag['frame_match'] = bool(frame_match)
+
+        # When caller does not provide a duration target, frame-count match is enough.
+        if expected_duration_sec is None and out_frames is not None and frame_match:
+            if diag is not None:
+                diag.update({'result': True, 'mode': 'frames_only'})
             return True
 
         target_duration = expected_duration_sec
@@ -264,14 +456,87 @@ def export_project(project: ProjectData, output_folder: Path,
             target_duration = expected_frames / expected_fps
 
         if target_duration is None or target_duration <= 0:
+            if diag is not None:
+                diag.update({'result': out_frames is None, 'failure': 'invalid_expected_duration'})
             return out_frames is None
 
-        out_duration = _get_duration_sec(path)
+        out_fps = _get_output_fps(path) if expected_fps and expected_fps > 0 else None
+        out_duration = None
+
+        # Prefer frame-count/FPS-derived duration when available because it matches the actual
+        # retimed stream precisely and avoids container-duration drift.
+        if out_frames is not None and out_frames > 0 and out_fps is not None and out_fps > 0:
+            out_duration = out_frames / out_fps
+
         if out_duration is None:
+            out_duration = _get_duration_sec(path)
+
+        if diag is not None:
+            diag['out_fps'] = out_fps
+            diag['out_duration_sec'] = out_duration
+            diag['target_duration_sec'] = target_duration
+
+        if out_duration is None:
+            if diag is not None:
+                diag.update({'result': False, 'failure': 'missing_output_duration'})
             return False
 
         duration_tolerance = max(0.04, (2.0 / expected_fps) if expected_fps and expected_fps > 0 else 0.08)
-        return abs(out_duration - target_duration) <= duration_tolerance
+        duration_match = abs(out_duration - target_duration) <= duration_tolerance
+        if diag is not None:
+            diag['duration_tolerance_sec'] = duration_tolerance
+            diag['duration_match'] = bool(duration_match)
+
+        # In FPS-sync mode, also verify stream FPS when expected_duration_sec is provided.
+        if expected_duration_sec is not None and expected_fps and expected_fps > 0:
+            if out_fps is None:
+                result = frame_match and duration_match
+                if diag is not None:
+                    diag.update({'result': bool(result), 'failure': None if result else 'missing_output_fps'})
+                return result
+            fps_tolerance = max(0.1, expected_fps * 0.01)
+            fps_match = abs(out_fps - expected_fps) <= fps_tolerance
+            result = frame_match and duration_match and fps_match
+            if diag is not None:
+                diag['fps_tolerance'] = fps_tolerance
+                diag['fps_match'] = bool(fps_match)
+                if not frame_match:
+                    failure = 'frame_mismatch'
+                elif not duration_match:
+                    failure = 'duration_mismatch'
+                elif not fps_match:
+                    failure = 'fps_mismatch'
+                else:
+                    failure = None
+                diag.update({'result': bool(result), 'failure': failure})
+            return result
+
+        result = frame_match and duration_match
+        if diag is not None:
+            diag.update({'result': bool(result), 'failure': None if result else ('frame_mismatch' if not frame_match else 'duration_mismatch')})
+        return result
+
+    def _summarize_validation(diag: Optional[Dict[str, object]]) -> str:
+        if not diag:
+            return "no validation details"
+        failure = diag.get('failure') or 'unknown'
+        return (
+            f"validation={failure}; expected(frames={diag.get('expected_frames')}, "
+            f"fps={diag.get('expected_fps')}, dur={diag.get('expected_duration_sec')}) "
+            f"actual(frames={diag.get('out_frames')}, fps={diag.get('out_fps')}, dur={diag.get('out_duration_sec')})"
+        )
+
+    def _summarize_encoder_diagnostics(diag: Optional[Dict[str, object]]) -> str:
+        if not diag:
+            return "no encoder diagnostics"
+        status = diag.get('status') or 'unknown'
+        category = diag.get('failure_category') or 'unknown'
+        attempts = diag.get('attempts') or []
+        last_attempt = attempts[-1] if attempts else {}
+        encoder = last_attempt.get('encoder') or diag.get('selected_encoder') or 'unknown'
+        stderr = (last_attempt.get('stderr') or diag.get('last_error') or '').strip()
+        stderr = stderr.replace('\n', ' ')[:220]
+        return f"status={status}; category={category}; encoder={encoder}; stderr={stderr or 'n/a'}"
 
     def _clamp_trim_range(video, start_frame_val, end_frame_val):
         total_frames = max(int(video.frame_count or 0), 1)
@@ -283,9 +548,26 @@ def export_project(project: ProjectData, output_folder: Path,
             end_clamped = total_frames - 1
         return start_clamped, end_clamped
 
+    def _prepare_output_for_write(path: Path) -> bool:
+        """Prepare destination path for write according to overwrite policy."""
+        if existing_file_policy != "overwrite":
+            return True
+        if not path.exists():
+            return True
+        try:
+            path.unlink()
+            return True
+        except Exception as e:
+            progress(f"  [FAIL] Cannot overwrite existing file {path.name}: {e}")
+            return False
+
     if not project.primary_video:
         progress("Error: No primary video loaded")
         return results
+
+    existing_file_policy = (existing_file_policy or "overwrite").strip().lower()
+    if existing_file_policy not in {"overwrite", "skip"}:
+        existing_file_policy = "overwrite"
 
     primary_video = project.primary_video
     raw_start_frame, raw_end_frame = primary_video.get_trimmed_range()
@@ -310,91 +592,153 @@ def export_project(project: ProjectData, output_folder: Path,
 
     export_count = get_next_export_count(output_folder, primary_video.name)
 
+    # Check if primary video should be exported (enabled_video_indices check)
+    export_primary = enabled_video_indices is None or 0 in enabled_video_indices
+
     # ===== PRIMARY VIDEO EXPORT =====
     progress("=" * 60)
-    progress("Exporting primary video...")
-    primary_out = output_folder / f"{primary_video.name}.mp4"
-    primary_out = safe_output_path(primary_out, f"_trim{export_count}")
+    
+    if not export_primary:
+        progress("Skipping primary video (disabled in playback panel)")
+    else:
+        progress("Exporting primary video...")
+        
+        # Generate custom filename or use default
+        if picker_id and condition:
+            custom_filename = _generate_custom_filename(primary_video, is_sensor=False)
+            primary_out = output_folder / custom_filename
+        else:
+            primary_out = output_folder / f"{primary_video.name}.mp4"
+            primary_out = safe_output_path(primary_out, f"_trim{export_count}")
 
-    primary_fps_precise = _probe_video_fps_precise(str(primary_video.file_path), primary_video.fps)
-    start_sec = start_frame / primary_fps_precise
-    expected_primary_frames = end_frame - start_frame + 1
-    expected_primary_duration_sec = expected_primary_frames / primary_fps_precise
-    ffmpeg_ok = False
+        if existing_file_policy == "skip" and primary_out.exists():
+            progress(f"  [SKIP] Primary video already exists: {primary_out.name}")
+            ffmpeg_ok = False
+        else:
+            if not _prepare_output_for_write(primary_out):
+                ffmpeg_ok = False
+                progress("  [FAIL] Primary export skipped due to file overwrite error")
+            else:
+                primary_fps_precise = _probe_video_fps_precise(str(primary_video.file_path), primary_video.fps)
+                start_sec = start_frame / primary_fps_precise
+                expected_primary_frames = end_frame - start_frame + 1
+                expected_primary_duration_sec = expected_primary_frames / primary_fps_precise
+                ffmpeg_ok = False
 
-    # Primary export is always re-encoded for frame-accurate cuts.
-    # Stream-copy can start on previous keyframes and produce visible decode artifacts
-    # or timeline jumps at the beginning of trimmed clips.
-    if primary_video.fps and primary_video.fps > 0 and expected_primary_frames > 0:
-        if export_trimmed_video_ffmpeg_reencode(
-            str(primary_video.file_path), str(primary_out), start_sec,
-            expected_primary_frames, primary_video.fps, pad_frames=0,
-            constant_bitrate=False,
-        ):
-            out_frames = _get_frame_count(primary_out)
-            if _is_timing_match(
-                primary_out,
-                expected_primary_frames,
-                primary_fps_precise,
-                expected_duration_sec=expected_primary_duration_sec,
-                frame_tolerance=2,
-            ):
-                ffmpeg_ok = True
-                results['primary_video'] = str(primary_out)
-                progress(f"  [OK] FFmpeg re-encode successful ({out_frames}/{expected_primary_frames} frames)")
-            elif _is_valid_video_output(primary_out) and out_frames is None:
-                ffmpeg_ok = True
-                results['primary_video'] = str(primary_out)
-                progress(f"  [OK] FFmpeg re-encode successful (expected {expected_primary_frames} frames)")
+                # Primary export is always re-encoded for frame-accurate cuts.
+                # Stream-copy can start on previous keyframes and produce visible decode artifacts
+                # or timeline jumps at the beginning of trimmed clips.
+                first_encode_diag = {}
+                first_validate_diag = {}
+                retry_encode_diag = {}
+                retry_validate_diag = {}
 
-    if not ffmpeg_ok:
-        progress("  Primary re-encode did not validate on first try; retrying with safer settings")
-        if export_trimmed_video_ffmpeg_reencode(
-            str(primary_video.file_path), str(primary_out), start_sec,
-            expected_primary_frames, primary_video.fps, pad_frames=0,
-            constant_bitrate=False,
-        ):
-            out_frames = _get_frame_count(primary_out)
-            if _is_timing_match(
-                primary_out,
-                expected_primary_frames,
-                primary_fps_precise,
-                expected_duration_sec=expected_primary_duration_sec,
-                frame_tolerance=2,
-            ):
-                ffmpeg_ok = True
-                results['primary_video'] = str(primary_out)
-                progress(f"  [OK] FFmpeg re-encode retry successful")
+                if primary_video.fps and primary_video.fps > 0 and expected_primary_frames > 0:
+                    if export_trimmed_video_ffmpeg_reencode(
+                        str(primary_video.file_path), str(primary_out), start_sec,
+                        expected_primary_frames, primary_video.fps, pad_frames=0,
+                        constant_bitrate=False,
+                        diagnostics=first_encode_diag,
+                    ):
+                        out_frames = _get_frame_count(primary_out)
+                        if _is_timing_match(
+                            primary_out,
+                            expected_primary_frames,
+                            primary_fps_precise,
+                            expected_duration_sec=expected_primary_duration_sec,
+                            frame_tolerance=2,
+                            diagnostics=first_validate_diag,
+                        ):
+                            ffmpeg_ok = True
+                            results['primary_video'] = str(primary_out)
+                            progress(f"  [OK] FFmpeg re-encode successful ({out_frames}/{expected_primary_frames} frames)")
+                        elif _is_valid_video_output(primary_out) and out_frames is None:
+                            ffmpeg_ok = True
+                            results['primary_video'] = str(primary_out)
+                            progress(f"  [OK] FFmpeg re-encode successful (expected {expected_primary_frames} frames)")
+                        else:
+                            progress(f"  [DIAG] Primary validation mismatch: {_summarize_validation(first_validate_diag)}")
+                    else:
+                        progress(f"  [DIAG] Primary encode failed (attempt 1): {_summarize_encoder_diagnostics(first_encode_diag)}")
 
-    if not ffmpeg_ok:
-        progress("  [FAIL] Failed to export primary video; continuing with sensor/additional exports")
+                if not ffmpeg_ok:
+                    progress("  Primary re-encode did not validate on first try; retrying with safer settings")
+                    if export_trimmed_video_ffmpeg_reencode(
+                        str(primary_video.file_path), str(primary_out), start_sec,
+                        expected_primary_frames, primary_video.fps, pad_frames=0,
+                        constant_bitrate=False,
+                        diagnostics=retry_encode_diag,
+                    ):
+                        out_frames = _get_frame_count(primary_out)
+                        if _is_timing_match(
+                            primary_out,
+                            expected_primary_frames,
+                            primary_fps_precise,
+                            expected_duration_sec=expected_primary_duration_sec,
+                            frame_tolerance=2,
+                            diagnostics=retry_validate_diag,
+                        ):
+                            ffmpeg_ok = True
+                            results['primary_video'] = str(primary_out)
+                            progress(f"  [OK] FFmpeg re-encode retry successful")
+                        else:
+                            progress(f"  [DIAG] Primary validation mismatch (retry): {_summarize_validation(retry_validate_diag)}")
+                    else:
+                        progress(f"  [DIAG] Primary encode failed (retry): {_summarize_encoder_diagnostics(retry_encode_diag)}")
 
-    if ffmpeg_ok and export_gaze_overlay and 'gaze' in project.sensor_data:
-        progress("Creating gaze overlay video...")
-        gaze_overlay_out = output_folder / f"{primary_video.name}.mp4"
-        gaze_overlay_out = safe_output_path(gaze_overlay_out, f"_trim{export_count}_gaze_overlay")
-        if create_gaze_overlay_video(str(primary_out), str(gaze_overlay_out), primary_video,
-                                     project.sensor_data['gaze'], start_frame, end_frame):
-            results['gaze_overlay_video'] = str(gaze_overlay_out)
+                if not ffmpeg_ok:
+                    progress("  [FAIL] Failed to export primary video; continuing with sensor/additional exports")
+
+        if ffmpeg_ok and export_gaze_overlay and 'gaze' in project.sensor_data:
+            progress("Creating gaze overlay video...")
+            if picker_id and condition:
+                custom_overlay_filename = _generate_custom_filename(primary_video, is_sensor=False)
+                custom_overlay_filename = custom_overlay_filename.replace(".mp4", "_gaze_overlay.mp4")
+                gaze_overlay_out = output_folder / custom_overlay_filename
+            else:
+                gaze_overlay_out = output_folder / f"{primary_video.name}.mp4"
+                gaze_overlay_out = safe_output_path(gaze_overlay_out, f"_trim{export_count}_gaze_overlay")
+            if existing_file_policy == "skip" and gaze_overlay_out.exists():
+                progress(f"  [SKIP] Gaze overlay already exists: {gaze_overlay_out.name}")
+            else:
+                if _prepare_output_for_write(gaze_overlay_out):
+                    if create_gaze_overlay_video(str(primary_out), str(gaze_overlay_out), primary_video,
+                                                 project.sensor_data['gaze'], start_frame, end_frame):
+                        results['gaze_overlay_video'] = str(gaze_overlay_out)
 
     # ===== SENSOR DATA EXPORT (CSV Files) =====
-    progress("Exporting sensor data...")
-    for sensor_name, sensor_data in project.sensor_data.items():
-        progress(f"  Trimming {sensor_name}...")
-        from data_synchronizer import trim_sensor_data
-        trimmed_df = trim_sensor_data(sensor_data, start_ns, end_ns)
+    if not export_primary:
+        progress("Skipping sensor data export because primary video is disabled")
+    else:
+        progress("Exporting sensor data...")
+        for sensor_name, sensor_data in project.sensor_data.items():
+            if picker_id and condition:
+                sensor_out = output_folder / _generate_custom_filename(
+                    primary_video, is_sensor=True, sensor_type=sensor_name
+                )
+            else:
+                original_name = sensor_data.file_path.stem
+                ext = sensor_data.file_path.suffix
+                sensor_out = output_folder / f"{original_name}{ext}"
+                sensor_out = safe_output_path(sensor_out, f"_trim{export_count}")
 
-        original_name = sensor_data.file_path.stem
-        ext = sensor_data.file_path.suffix
-        sensor_out = output_folder / f"{original_name}{ext}"
-        sensor_out = safe_output_path(sensor_out, f"_trim{export_count}")
+            if existing_file_policy == "skip" and sensor_out.exists():
+                progress(f"  [SKIP] Sensor file already exists: {sensor_out.name}")
+                continue
 
-        try:
-            write_data_file(trimmed_df, sensor_out, sensor_data.format_type)
-            results[sensor_name] = str(sensor_out)
-            progress(f"    [OK] Saved {len(trimmed_df)} rows")
-        except Exception as e:
-            progress(f"  Error saving {sensor_name}: {e}")
+            if not _prepare_output_for_write(sensor_out):
+                continue
+
+            progress(f"  Trimming {sensor_name}...")
+            from data_synchronizer import trim_sensor_data
+            trimmed_df = trim_sensor_data(sensor_data, start_ns, end_ns)
+
+            try:
+                write_data_file(trimmed_df, sensor_out, sensor_data.format_type)
+                results[sensor_name] = str(sensor_out)
+                progress(f"    [OK] Saved {len(trimmed_df)} rows")
+            except Exception as e:
+                progress(f"  Error saving {sensor_name}: {e}")
 
     # ===== ADDITIONAL VIDEOS EXPORT =====
     progress("=" * 60)
@@ -410,9 +754,13 @@ def export_project(project: ProjectData, output_folder: Path,
     )
 
     for i, video in enumerate(project.additional_videos):
+        # Check if this video should be exported (enabled_video_indices: i+1 because 0 is primary)
+        video_index = i + 1
+        if enabled_video_indices is not None and video_index not in enabled_video_indices:
+            progress(f"  Video {i+2}: {video.name} (skipped - disabled)")
+            continue
+        
         progress(f"  Video {i+2}: {video.name}")
-        # Probe each video's own bitrate to avoid using a mismatched reference value
-        additional_reference_bitrate = _probe_video_bitrate_kbps(str(video.file_path))
 
         raw_video_start = video.start_frame if video.start_frame is not None else 0
         raw_video_end = video.end_frame if video.end_frame is not None else video.frame_count - 1
@@ -424,176 +772,113 @@ def export_project(project: ProjectData, output_folder: Path,
             )
         source_len = max(0, video_end_frame - video_start_frame + 1)
         source_fps_precise = _probe_video_fps_precise(str(video.file_path), video.fps)
+        additional_reference_bitrate = _probe_video_bitrate_kbps(str(video.file_path))
 
-        # ------ determine target_frames and adjusted output FPS ------
-        if sync_fps:
-            # FPS-Sync mode: keep the exact trim range; adjust output FPS so that
-            # duration equals the primary video duration (no padding / truncation).
-            target_frames = source_len
-            if source_fps_precise > 0 and primary_duration_sec > 0:
-                adjusted_out_fps = source_len / primary_duration_sec
-            else:
-                adjusted_out_fps = source_fps_precise or 30.0
-            progress(
-                f"    FPS-Sync mode: {source_len} source frames, "
-                f"output fps {adjusted_out_fps:.9f} (source {source_fps_precise:.9f}) "
-                f"-> duration {primary_duration_sec:.6f}s"
-            )
+        # Single synchronization mode: keep exact selected frames and adjust FPS so
+        # duration matches primary video duration (no padding/truncation).
+        target_frames = source_len
+        if source_fps_precise > 0 and primary_duration_sec > 0:
+            adjusted_out_fps = source_len / primary_duration_sec
         else:
-            # Trim mode: compute target_frames from primary duration × this video's fps;
-            # shorter clips are padded, longer ones truncated.
-            adjusted_out_fps = None  # use source fps
-            if source_fps_precise > 0:
-                target_frames = int(round(primary_duration_sec * source_fps_precise))
-            else:
-                target_frames = primary_frame_count
-
-            if source_len > target_frames:
-                video_end_frame = video_start_frame + target_frames - 1
-                source_len = target_frames
-
-            if video_start_frame > video_end_frame:
-                video_start_frame = 0
-                video_end_frame = min(video.frame_count - 1, max(target_frames - 1, 0))
-                source_len = max(0, video_end_frame - video_start_frame + 1)
+            adjusted_out_fps = source_fps_precise or 30.0
+        progress(
+            f"    FPS-Sync mode: {source_len} source frames, "
+            f"output fps {adjusted_out_fps:.9f} (source {source_fps_precise:.9f}) "
+            f"-> duration {primary_duration_sec:.6f}s"
+        )
 
         progress(f"    Frame range: {video_start_frame}-{video_end_frame} ({source_len} frames)")
 
-        video_out = output_folder / f"{video.name}.mp4"
-        video_out = safe_output_path(video_out, f"_trim{export_count}")
-
-        start_sec_add = video_start_frame / source_fps_precise if source_fps_precise > 0 else 0.0
-        ffmpeg_add_ok = False
-
-        # Detect HEVC (must re-encode regardless of mode)
-        video_is_hevc = _detect_video_codec_needs_conversion(str(video.file_path))
-
-        # In FPS-Sync mode we always re-encode (stream copy cannot change declared FPS),
-        # regardless of the source codec.
-        needs_reencode = video_is_hevc or sync_fps
-
-        if video_is_hevc:
-            progress(f"    Detected HEVC codec (not Windows-compatible), forcing re-encode to H.264")
-
-        if needs_reencode:
-            # ---- Re-encode path (HEVC conversion OR FPS-Sync mode) ----
-            pad = 0 if sync_fps else max(0, target_frames - source_len)
-            if source_fps_precise > 0 and target_frames > 0:
-                if export_trimmed_video_ffmpeg_reencode(
-                    str(video.file_path), str(video_out), start_sec_add, target_frames, source_fps_precise,
-                    pad_frames=pad,
-                    target_bitrate_kbps=additional_reference_bitrate,
-                    # VBR/CRF path avoids avoidable bloat versus strict CBR.
-                    constant_bitrate=False,
-                    output_fps=adjusted_out_fps,
-                ):
-                    out_frames = _get_frame_count(video_out)
-                    tolerance = 2 if sync_fps else 4
-                    expected_duration = primary_duration_sec if sync_fps else None
-                    if _is_timing_match(
-                        video_out,
-                        target_frames,
-                        adjusted_out_fps if sync_fps else source_fps_precise,
-                        expected_duration_sec=expected_duration,
-                        frame_tolerance=tolerance,
-                    ):
-                        ffmpeg_add_ok = True
-                        progress(f"    [OK] FFmpeg re-encode successful")
-
-                if not ffmpeg_add_ok:
-                    progress("    Initial re-encode did not produce a valid output; retrying with safer VBR settings")
-                    safer_bitrate = min(int(additional_reference_bitrate or 8000), 12000)
-                    if export_trimmed_video_ffmpeg_reencode(
-                        str(video.file_path), str(video_out), start_sec_add, target_frames, source_fps_precise,
-                        pad_frames=pad,
-                        target_bitrate_kbps=safer_bitrate,
-                        constant_bitrate=False,
-                        output_fps=adjusted_out_fps,
-                    ):
-                        out_frames = _get_frame_count(video_out)
-                        tolerance = 2 if sync_fps else 4
-                        expected_duration = primary_duration_sec if sync_fps else None
-                        if _is_timing_match(
-                            video_out,
-                            target_frames,
-                            adjusted_out_fps if sync_fps else source_fps_precise,
-                            expected_duration_sec=expected_duration,
-                            frame_tolerance=tolerance,
-                        ):
-                            ffmpeg_add_ok = True
-                            progress(f"    [OK] FFmpeg safer retry successful")
-
-                if not ffmpeg_add_ok:
-                    progress("    FFmpeg retries failed; falling back to OpenCV export")
-                    success, frames_written, expected_frames = export_trimmed_video_opencv(
-                        str(video.file_path),
-                        str(video_out),
-                        video_start_frame,
-                        video_end_frame,
-                        source_fps_precise,
-                        target_frame_count=target_frames,
-                    )
-                    if success and _is_valid_video_output(video_out):
-                        ffmpeg_add_ok = True
-                        progress(f"    [OK] OpenCV fallback successful ({frames_written}/{expected_frames} frames)")
+        # Generate custom filename or use default
+        if picker_id and condition:
+            custom_filename = _generate_custom_filename(video, is_sensor=False)
+            video_out = output_folder / custom_filename
         else:
-            # ---- Trim mode, H.264: try stream copy first ----
-            duration_candidates = []
-            if video.fps and video.fps > 0 and target_frames > 0:
-                for frame_delta in [-1, 0, 1, -2, 2]:
-                    candidate_frames = max(target_frames + frame_delta, 1)
-                    duration_candidates.append(candidate_frames / source_fps_precise)
-            else:
-                duration_candidates.append(primary_duration_sec)
+            video_out = output_folder / f"{video.name}.mp4"
+            video_out = safe_output_path(video_out, f"_trim{export_count}")
 
-            for attempt, duration_sec_add in enumerate(duration_candidates, start=1):
-                progress(f"    FFmpeg attempt {attempt}: duration={duration_sec_add:.9f}s")
-                if not export_trimmed_video_ffmpeg(str(video.file_path), str(video_out), start_sec_add, duration_sec_add):
-                    continue
-                out_frames = _get_frame_count(video_out)
+        if existing_file_policy == "skip" and video_out.exists():
+            progress(f"    [SKIP] Additional video already exists: {video_out.name}")
+            continue
+
+        if not _prepare_output_for_write(video_out):
+            continue
+
+        ffmpeg_add_ok = False
+        start_sec_add = video_start_frame / source_fps_precise if source_fps_precise > 0 else 0.0
+        first_encode_diag = {}
+        first_validate_diag = {}
+        retry_encode_diag = {}
+        retry_validate_diag = {}
+
+        # Exact-frame sync export: preserve selected frame count and use adjusted FPS.
+        # Prefer FFmpeg re-encode first to keep codec/bitrate behavior close to source.
+        progress("    Exact-frame FPS sync export (codec/bitrate-preserving)")
+        if source_fps_precise > 0 and target_frames > 0:
+            if export_trimmed_video_ffmpeg_reencode(
+                str(video.file_path),
+                str(video_out),
+                start_sec_add,
+                target_frames,
+                source_fps_precise,
+                pad_frames=0,
+                target_bitrate_kbps=additional_reference_bitrate,
+                constant_bitrate=False,
+                output_fps=adjusted_out_fps,
+                diagnostics=first_encode_diag,
+            ):
                 if _is_timing_match(
                     video_out,
                     target_frames,
-                    source_fps_precise,
-                    expected_duration_sec=None,
-                    frame_tolerance=4,
+                    adjusted_out_fps,
+                    expected_duration_sec=primary_duration_sec,
+                    frame_tolerance=2,
+                    diagnostics=first_validate_diag,
                 ):
                     ffmpeg_add_ok = True
-                    progress(f"    [OK] FFmpeg export successful")
-                    break
+                    progress("    [OK] FFmpeg sync export successful")
+                else:
+                    progress(f"    [DIAG] Sync validation mismatch: {_summarize_validation(first_validate_diag)}")
+            else:
+                progress(f"    [DIAG] Sync encode failed (attempt 1): {_summarize_encoder_diagnostics(first_encode_diag)}")
 
-            if not ffmpeg_add_ok:
-                progress("    Stream-copy failed; using FFmpeg re-encode")
-                pad_frames = max(0, target_frames - source_len)
+        if not ffmpeg_add_ok:
+            progress("    FFmpeg sync export did not validate; retrying with safer bitrate")
+            safer_bitrate = min(int(additional_reference_bitrate or 8000), 12000)
+            if source_fps_precise > 0 and target_frames > 0:
                 if export_trimmed_video_ffmpeg_reencode(
-                    str(video.file_path), str(video_out), start_sec_add, target_frames, source_fps_precise,
-                    pad_frames=pad_frames,
-                    target_bitrate_kbps=additional_reference_bitrate,
+                    str(video.file_path),
+                    str(video_out),
+                    start_sec_add,
+                    target_frames,
+                    source_fps_precise,
+                    pad_frames=0,
+                    target_bitrate_kbps=safer_bitrate,
                     constant_bitrate=False,
+                    output_fps=adjusted_out_fps,
+                    diagnostics=retry_encode_diag,
                 ):
-                    out_frames = _get_frame_count(video_out)
                     if _is_timing_match(
                         video_out,
                         target_frames,
-                        source_fps_precise,
-                        expected_duration_sec=None,
-                        frame_tolerance=4,
+                        adjusted_out_fps,
+                        expected_duration_sec=primary_duration_sec,
+                        frame_tolerance=2,
+                        diagnostics=retry_validate_diag,
                     ):
                         ffmpeg_add_ok = True
-                        progress(f"    [OK] FFmpeg re-encode successful")
+                        progress("    [OK] FFmpeg safer retry successful")
+                    else:
+                        progress(f"    [DIAG] Sync validation mismatch (retry): {_summarize_validation(retry_validate_diag)}")
+                else:
+                    progress(f"    [DIAG] Sync encode failed (retry): {_summarize_encoder_diagnostics(retry_encode_diag)}")
 
-                if not ffmpeg_add_ok:
-                    success, frames_written, expected_frames = export_trimmed_video_opencv(
-                        str(video.file_path),
-                        str(video_out),
-                        video_start_frame,
-                        video_end_frame,
-                        source_fps_precise,
-                        target_frame_count=target_frames,
-                    )
-                    if success and _is_valid_video_output(video_out):
-                        ffmpeg_add_ok = True
-                        progress(f"    [OK] OpenCV fallback successful ({frames_written}/{expected_frames} frames)")
+        if not ffmpeg_add_ok:
+            progress("    [FAIL] FFmpeg sync export failed for this video (OpenCV fallback disabled - it produces large, choppy output)")
+            try:
+                video_out.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         if ffmpeg_add_ok:
             results[f'additional_video_{i+1}'] = str(video_out)
@@ -605,53 +890,116 @@ def export_project(project: ProjectData, output_folder: Path,
     return results
 
 
-def export_project_metadata(project: ProjectData, output_folder: Path, trim_index: Optional[int] = None) -> Path:
+def export_project_metadata(project: ProjectData,
+                            output_folder: Path,
+                            condition: str,
+                            existing_file_policy: str = "overwrite",
+                            enabled_video_indices: Optional[List[int]] = None,
+                            export_results: Optional[Dict[str, str]] = None) -> Path:
     """Export metadata file describing the project."""
+    export_results = export_results or {}
+
+    def _video_label(video: VideoData) -> str:
+        camera = (video.camera_type or ("eyes" if video.is_primary else "unknown")).strip()
+        return f"{camera} ({video.name})"
+
+    def _probe_exported_video_stats(path: Path):
+        """Return measured (fps, duration_sec) from an exported file when possible."""
+        fps_val = None
+        dur_val = None
+        try:
+            cmd = [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=avg_frame_rate,r_frame_rate:format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                str(path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0:
+                lines = [line.strip() for line in (result.stdout or '').splitlines() if line.strip()]
+                # stream rates first, duration last
+                if lines:
+                    for candidate in lines[:2]:
+                        parsed = _parse_fps_fraction(candidate)
+                        if parsed is not None and parsed > 0:
+                            fps_val = parsed
+                            break
+                    try:
+                        dur_val = float(lines[-1])
+                    except Exception:
+                        dur_val = None
+        except Exception:
+            pass
+        return fps_val, dur_val
+
     metadata = {
-        'project_name': project.name,
-        'primary_video': project.primary_video.name if project.primary_video else None,
         'primary_video_file': str(project.primary_video.file_path) if project.primary_video else None,
         'additional_video_files': [str(v.file_path) for v in project.additional_videos],
         'sensor_data_files': {
             sensor_name: str(sensor_data.file_path)
             for sensor_name, sensor_data in project.sensor_data.items()
         },
+        'video_trimming': {},
     }
-    
-    if project.primary_video:
-        start_frame, end_frame = project.primary_video.get_trimmed_range()
-        start_ns, end_ns = project.get_trimmed_time_range()
-        metadata.update({
-            'trim_start_frame': start_frame,
-            'trim_end_frame': end_frame,
-            'trim_start_timestamp_ns': start_ns,
-            'trim_end_timestamp_ns': end_ns,
-            'fps': project.primary_video.fps,
-            'duration_seconds': project.get_trimmed_duration(),
-        })
+
+    # Include trim information for all exported videos (primary + enabled additionals).
+    if project.primary_video and 'primary_video' in export_results:
+        video = project.primary_video
+        start_frame, end_frame = video.get_trimmed_range()
+        start_ns = video.get_frame_timestamp(start_frame)
+        end_ns = video.get_frame_timestamp(end_frame)
+        measured_fps, measured_duration = _probe_exported_video_stats(Path(export_results['primary_video']))
+        metadata['video_trimming'][_video_label(video)] = {
+            'trim_start_frame': int(start_frame),
+            'trim_end_frame': int(end_frame),
+            'trim_start_timestamp_ns': int(start_ns),
+            'trim_end_timestamp_ns': int(end_ns),
+            'fps': float(measured_fps if measured_fps is not None else video.fps),
+            'duration_seconds': float(
+                measured_duration if measured_duration is not None else ((end_frame - start_frame + 1) / max(video.fps, 1e-9))
+            ),
+            'source_video_file': str(video.file_path),
+            'exported_video_file': str(export_results['primary_video']),
+        }
+
+    for i, video in enumerate(project.additional_videos):
+        result_key = f'additional_video_{i+1}'
+        if result_key not in export_results:
+            continue
+        video_index = i + 1
+        if enabled_video_indices is not None and video_index not in enabled_video_indices:
+            continue
+
+        start_frame, end_frame = video.get_trimmed_range()
+        start_ns = video.get_frame_timestamp(start_frame)
+        end_ns = video.get_frame_timestamp(end_frame)
+        measured_fps, measured_duration = _probe_exported_video_stats(Path(export_results[result_key]))
+        metadata['video_trimming'][_video_label(video)] = {
+            'trim_start_frame': int(start_frame),
+            'trim_end_frame': int(end_frame),
+            'trim_start_timestamp_ns': int(start_ns),
+            'trim_end_timestamp_ns': int(end_ns),
+            'fps': float(measured_fps if measured_fps is not None else video.fps),
+            'duration_seconds': float(
+                measured_duration if measured_duration is not None else ((end_frame - start_frame + 1) / max(video.fps, 1e-9))
+            ),
+            'source_video_file': str(video.file_path),
+            'exported_video_file': str(export_results[result_key]),
+        }
     
     import json
 
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    if trim_index is None:
-        existing_indices = []
-        for path in output_folder.glob('export_metadata_trim*.json'):
-            match = re.search(r'_trim(\d+)$', path.stem)
-            if match:
-                try:
-                    existing_indices.append(int(match.group(1)))
-                except ValueError:
-                    pass
-        trim_index = (max(existing_indices) + 1) if existing_indices else 1
+    existing_file_policy = (existing_file_policy or "overwrite").strip().lower()
+    if existing_file_policy not in {"overwrite", "skip"}:
+        existing_file_policy = "overwrite"
 
-    # Guarantee uniqueness in case trim_index is already present
-    candidate_index = max(1, int(trim_index))
-    metadata_path = output_folder / f"export_metadata_trim{candidate_index}.json"
-    while metadata_path.exists():
-        candidate_index += 1
-        metadata_path = output_folder / f"export_metadata_trim{candidate_index}.json"
+    metadata_path = output_folder / _build_metadata_filename(condition)
+
+    if existing_file_policy == "skip" and metadata_path.exists():
+        return metadata_path
 
     with open(metadata_path, 'w') as f:
         json.dump(metadata, f, indent=2, default=str)

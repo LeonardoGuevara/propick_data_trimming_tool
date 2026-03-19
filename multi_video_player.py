@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 from typing import Optional, Dict, List
 from models import VideoData, SensorData
-from gui_utils import format_time, format_fps, get_gaze_columns, find_closest_timestamp_index
+from gui_utils import format_time, format_fps, get_gaze_columns, find_closest_timestamp_index, video_display_name
 
 
 class SingleVideoDisplay(QtWidgets.QWidget):
@@ -387,7 +387,7 @@ class MultiVideoPlayerWidget(QtWidgets.QWidget):
         main_layout.addWidget(scroll_area)
 
         # Add primary video
-        self._add_video("primary", self.primary_video, "Primary Video (Eye Tracking)", is_primary=True)
+        self._add_video("primary", self.primary_video, video_display_name(self.primary_video), is_primary=True)
 
         self.setLayout(main_layout)
     
@@ -432,7 +432,7 @@ class MultiVideoPlayerWidget(QtWidgets.QWidget):
     def add_additional_video(self, video: VideoData, video_index: int) -> str:
         """Add an additional video (video_index is 0-based)."""
         video_id = f"video_{video_index}"
-        self._add_video(video_id, video, f"Video {video_index + 2} ({video.name})", is_primary=False)
+        self._add_video(video_id, video, video_display_name(video), is_primary=False)
         return video_id
     
     def _on_primary_frame_changed(self, frame_num: int):

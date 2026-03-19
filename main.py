@@ -9,12 +9,17 @@ from models import ProjectData, VideoData, SensorData
 from data_loader import find_eye_tracking_files, load_video, load_sensor_data
 from multi_video_player import MultiVideoPlayerWidget
 from sync_trim_panel import SyncTrimPanel
-from data_exporter import export_project, export_project_metadata
-from gui_utils import format_time, format_fps
+from data_exporter import export_project, export_project_metadata, preview_export_file_paths
+from gui_utils import format_time, format_fps, video_display_name, ExportNamingDialog, CameraSelectionDialog
 
 
 class MainWindow(QtWidgets.QMainWindow):
     """Main application window."""
+
+    @staticmethod
+    def _video_display_name(video: VideoData) -> str:
+        """Return camera-based label for UI."""
+        return video_display_name(video)
     
     def __init__(self):
         super().__init__()
@@ -208,7 +213,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.statusLabel.setText(
                 f"Loaded: {self.project.name} | "
-                f"Primary video: {primary_video.name} ({primary_video.frame_count} frames, {format_fps(primary_video.fps)} fps) | "
+                f"Video: {self._video_display_name(primary_video)} ({primary_video.frame_count} frames, {format_fps(primary_video.fps)} fps) | "
                 f"Sensor data: {', '.join(self.project.sensor_data.keys())}"
             )
             
@@ -233,7 +238,20 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         try:
-            additional_video = load_video(Path(file_path), is_primary=False)
+            # Ask for camera type
+            video_filename = Path(file_path).name
+            camera_dialog = CameraSelectionDialog(video_filename, self)
+            if camera_dialog.exec_() != QtWidgets.QDialog.Accepted:
+                self.statusLabel.setText("Video import cancelled")
+                return
+            
+            camera_type = camera_dialog.get_camera_type()
+            if not camera_type:
+                QtWidgets.QMessageBox.warning(self, "Error", "No camera type selected")
+                return
+            
+            # Load video with camera type
+            additional_video = load_video(Path(file_path), is_primary=False, camera_type=camera_type)
             self.project.additional_videos.append(additional_video)
             
             # Add to multi-video player with 0-based index
@@ -253,7 +271,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_video_visibility_controls()
             self._update_sync_panel()
             
-            self.statusLabel.setText(f"Added video: {additional_video.name}")
+            self.statusLabel.setText(f"Added video: {self._video_display_name(additional_video)}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load video: {str(e)}")
     
@@ -304,7 +322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_visibility = {}
         
         # Primary video
-        primary_checkbox = QtWidgets.QCheckBox(f"Primary Video ({self.project.primary_video.name})")
+        primary_checkbox = QtWidgets.QCheckBox(self._video_display_name(self.project.primary_video))
         primary_checkbox.setChecked(True)
         primary_checkbox.stateChanged.connect(lambda state: self._on_video_visibility_changed("primary", state == QtCore.Qt.Checked))
         self.video_visibility_layout.addWidget(primary_checkbox)
@@ -313,7 +331,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Additional videos
         for i, video in enumerate(self.project.additional_videos):
             video_id = f"video_{i}"
-            video_checkbox = QtWidgets.QCheckBox(f"Video {i+2} ({video.name})")
+            video_checkbox = QtWidgets.QCheckBox(self._video_display_name(video))
             video_checkbox.setChecked(True)
             video_checkbox.stateChanged.connect(lambda state, vid_id=video_id: self._on_video_visibility_changed(vid_id, state == QtCore.Qt.Checked))
             self.video_visibility_layout.addWidget(video_checkbox)
@@ -460,7 +478,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Add primary video info
             all_videos_info.append({
                 'index': 0,
-                'name': 'Primary (1)',
+                'name': self._video_display_name(primary),
                 'target_frames': primary_frame_count,
                 'target_seconds': primary_duration_sec,
                 'fps': primary.fps,
@@ -485,7 +503,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 all_videos_info.append({
                     'index': i + 1,
-                    'name': f'Video {i+2}',
+                    'name': self._video_display_name(video),
                     'source_trimmed_frames': trimmed_frames,
                     'source_trimmed_seconds': trimmed_seconds,
                     'target_frames': target_frames,
@@ -501,7 +519,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append("Export Preview  —  FPS Sync Mode:")
                 lines.append("=" * 88)
                 lines.append(
-                    f"Primary (Video 1):  {primary_frame_count} frames  "
+                    f"{all_videos_info[0]['name']}:  {primary_frame_count} frames  "
                     f"({primary_duration_sec:.3f}s  at {format_fps(primary.fps)} fps)"
                 )
                 for info in all_videos_info[1:]:
@@ -558,7 +576,65 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             export_gaze_overlay = overlay_checkbox.isChecked()
-            use_sync_fps = True
+
+            # ---- Collect enabled videos ----
+            enabled_video_indices = []
+            if self.video_visibility.get("primary") and self.video_visibility.get("primary").isChecked():
+                enabled_video_indices.append(0)  # Index 0 = primary video
+            for i in range(len(self.project.additional_videos)):
+                video_id = f"video_{i}"
+                if video_id in self.video_visibility and self.video_visibility[video_id].isChecked():
+                    enabled_video_indices.append(i + 1)  # Index i+1 = additional video i
+
+            # ---- Show naming dialog ----
+            naming_dialog = ExportNamingDialog(self)
+            if naming_dialog.exec_() != QtWidgets.QDialog.Accepted:
+                self.statusLabel.setText("Export cancelled")
+                return
+            
+            naming_params = naming_dialog.get_parameters()
+            if not naming_params:
+                return
+            picker_id, condition = naming_params
+
+            planned_paths = preview_export_file_paths(
+                self.project,
+                Path(output_folder),
+                picker_id,
+                condition,
+                export_gaze_overlay=export_gaze_overlay,
+                enabled_video_indices=enabled_video_indices,
+            )
+            existing_paths = [p for p in planned_paths.values() if p.exists()]
+
+            existing_file_policy = "overwrite"
+            if existing_paths:
+                unique_existing = sorted({str(p) for p in existing_paths})
+                preview_items = unique_existing[:12]
+                remaining = max(0, len(unique_existing) - len(preview_items))
+                details = "\n".join(f"- {Path(p).name}" for p in preview_items)
+                if remaining > 0:
+                    details += f"\n- ... and {remaining} more"
+
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Existing Export Files Detected",
+                    "Some output filenames already exist in the selected folder.\n\n"
+                    "Existing files:\n"
+                    f"{details}\n\n"
+                    "Yes = Override existing files\n"
+                    "No = Skip existing files\n"
+                    "Cancel = Stop export",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No | QtWidgets.QMessageBox.Cancel,
+                    QtWidgets.QMessageBox.No,
+                )
+                if reply == QtWidgets.QMessageBox.Cancel:
+                    self.statusLabel.setText("Export cancelled")
+                    return
+                if reply == QtWidgets.QMessageBox.No:
+                    existing_file_policy = "skip"
+                else:
+                    existing_file_policy = "overwrite"
 
             # Show progress dialog
             progress = QtWidgets.QProgressDialog(
@@ -567,28 +643,30 @@ class MainWindow(QtWidgets.QMainWindow):
             progress.setWindowModality(QtCore.Qt.WindowModal)
             progress.show()
             
-            # Export
+            # Export with naming parameters
             results = export_project(
                 self.project,
                 Path(output_folder),
                 export_gaze_overlay=export_gaze_overlay,
-                sync_fps=use_sync_fps,
-                progress_callback=lambda msg: None  # Could update progress dialog here
+                progress_callback=lambda msg: None,  # Could update progress dialog here
+                picker_id=picker_id,
+                condition=condition,
+                enabled_video_indices=enabled_video_indices,
+                existing_file_policy=existing_file_policy,
             )
-            
-            # Also export metadata (match trim index when available)
-            trim_index = None
-            primary_path = results.get('primary_video')
-            if primary_path:
-                stem = Path(primary_path).stem
-                match = re.search(r'_trim(\d+)', stem)
-                if match:
-                    try:
-                        trim_index = int(match.group(1))
-                    except ValueError:
-                        trim_index = None
 
-            metadata_path = export_project_metadata(self.project, Path(output_folder), trim_index=trim_index)
+            metadata_path = None
+            metadata_updated = len(results) > 0
+            if metadata_updated:
+                # Always refresh metadata when at least one output file was created/overwritten.
+                metadata_path = export_project_metadata(
+                    self.project,
+                    Path(output_folder),
+                    condition=condition,
+                    existing_file_policy="overwrite",
+                    enabled_video_indices=enabled_video_indices,
+                    export_results=results,
+                )
             
             progress.close()
             
@@ -606,13 +684,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 msg += "  - Skipped\n"
             
             # Additional videos
-            additional_count = sum(1 for key in results.keys() if key.startswith('additional_video_'))
-            if additional_count > 0:
-                msg += f"\n📹 Additional Videos ({additional_count}):\n"
-                for i in range(1, additional_count + 1):
-                    key = f'additional_video_{i}'
-                    if key in results:
-                        msg += f"  ✓ {Path(results[key]).name}\n"
+            additional_keys = sorted(
+                [key for key in results.keys() if key.startswith('additional_video_')],
+                key=lambda k: int(k.rsplit('_', 1)[1])
+            )
+            if additional_keys:
+                msg += f"\n📹 Additional Videos ({len(additional_keys)}):\n"
+                for key in additional_keys:
+                    msg += f"  ✓ {Path(results[key]).name}\n"
             
             # Sensor data
             sensor_keys = [k for k in results.keys() if k not in ['primary_video', 'gaze_overlay_video'] 
@@ -622,7 +701,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 for key in sensor_keys:
                     msg += f"  ✓ {Path(results[key]).name}\n"
 
-            msg += f"\n📝 Metadata:\n  ✓ {Path(metadata_path).name}\n"
+            msg += "\n📝 Metadata:\n"
+            if metadata_path is not None:
+                msg += f"  ✓ {Path(metadata_path).name}\n"
+            else:
+                msg += "  - Skipped (no new files created or overwritten)\n"
             
             QtWidgets.QMessageBox.information(self, "Success", msg)
             
@@ -636,7 +719,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Create dialog to select which video to remove
-        video_names = [f"Video {i+2}: {v.name}" for i, v in enumerate(self.project.additional_videos)]
+        video_names = [self._video_display_name(v) for v in self.project.additional_videos]
         selected, ok = QtWidgets.QInputDialog.getItem(
             self, "Remove Video", "Select video to remove:", video_names
         )
@@ -688,7 +771,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_video_visibility_controls()
             self._update_sync_panel()
             
-            self.statusLabel.setText(f"Removed video: {removed_video.name}")
+            self.statusLabel.setText(f"Removed video: {self._video_display_name(removed_video)}")
     
     def _on_clear_all_data(self):
         """Clear all imported data (eye tracking and videos)."""
